@@ -114,49 +114,93 @@ defmodule Mob.Wake.Registry do
 
     :mob_wake_nif.take_pending_wakes()
     |> Enum.each(fn identifier ->
-      send(self(), {:wake_fired, identifier_to_atom(identifier)})
+      case identifier_to_atom(identifier) do
+        nil -> :ok
+        atom -> send(self(), {:wake_fired, atom})
+      end
     end)
   catch
     :error, :undef -> :ok
     :error, :nif_not_loaded -> :ok
   end
 
-  defp identifier_to_atom(bin) when is_binary(bin), do: String.to_atom(bin)
+  # `String.to_existing_atom` — deliberately does NOT accept arbitrary
+  # binaries and mint atoms from them. The push_fired path in particular
+  # is fed by APNs / FCM payload content, which is caller-controlled
+  # (relay operator or worse), and String.to_atom on that would exhaust
+  # the atom table. All legitimate identifiers were seeded from
+  # config :mob_wake, :tasks or a runtime Mob.Wake.register/3 call —
+  # both create the atom before the wire ever names it.
+  #
+  # Returns `nil` for an unregistered identifier so callers can drop.
+  defp identifier_to_atom(bin) when is_binary(bin) do
+    String.to_existing_atom(bin)
+  rescue
+    ArgumentError ->
+      Logger.warning("mob_wake: ignoring event for unregistered identifier: #{inspect(bin)}")
+      nil
+  end
+
   defp identifier_to_atom(atom) when is_atom(atom), do: atom
 
   @impl true
   def handle_info({:wake_fired, identifier}, s) when is_atom(identifier) do
-    # Native BGTask fire (MOB-261). Dispatch under the task supervisor
-    # so a slow handler doesn't back up further wake events.
-    # `complete_task` feeds iOS's setTaskCompleted(success:); success
-    # argument matches the honest-reliability discipline — iOS's
-    # opportunistic scheduler LEARNS from these, so lying degrades
-    # future fires.
-    Task.Supervisor.start_child(Mob.Wake.TaskSupervisor, fn ->
-      result = Mob.Wake.dispatch(identifier)
-      success_atom = if result == :ok, do: :ok, else: :error
-      complete_native(identifier, success_atom)
-    end)
+    # Native BGTask (iOS) / WorkManager (Android) fire. Dispatch under
+    # the task supervisor so a slow handler doesn't back up further
+    # wake events. Success argument matches the honest-reliability
+    # discipline — iOS's opportunistic scheduler LEARNS from these,
+    # so lying degrades future fires.
+    #
+    # We check start_child's return so a Task.Supervisor at capacity
+    # (or otherwise refusing) doesn't drop the wake silently. On
+    # failure we complete the OS-side task as :error so the platform
+    # sees "we tried and couldn't" rather than hanging until its own
+    # timeout (30s on iOS, 9-min on Android).
+    case Task.Supervisor.start_child(Mob.Wake.TaskSupervisor, fn ->
+           complete_native(identifier, wake_result_atom(Mob.Wake.dispatch(identifier)))
+         end) do
+      {:ok, _pid} ->
+        :ok
+
+      other ->
+        Logger.warning("mob_wake: TaskSupervisor refused wake dispatch: #{inspect(other)}")
+        complete_native(identifier, :error)
+    end
 
     {:noreply, s}
   end
 
   def handle_info({:push_fired, identifier_bin, push_id, payload_json}, s)
       when is_binary(identifier_bin) and is_binary(push_id) and is_binary(payload_json) do
-    # Native silent-APNs fire (MOB-262). Payload is delivered as JSON
-    # binary to keep mob_wake out of the JSON-library-dep business —
-    # handlers decode with Jason / :json / their choice. dispatch's
-    # return maps to UIBackgroundFetchResult via `complete_push`:
+    # Native silent-APNs / FCM data fire. Payload is delivered as JSON
+    # binary to keep mob_wake out of the JSON-library-dep business.
+    # dispatch's return maps to UIBackgroundFetchResult via
+    # `complete_push`:
     #   :ok               → :new_data  (iOS learns push was worthwhile)
     #   {:ok, :no_data}   → :no_data   (routed but no new data fetched)
     #   {:error, _}       → :failed
-    identifier = identifier_to_atom(identifier_bin)
+    case identifier_to_atom(identifier_bin) do
+      nil ->
+        # Unregistered identifier — sender has a stale server-side task
+        # table or is fuzzing us. Tell the platform :failed so iOS's
+        # opportunistic scheduler doesn't over-invest in future pushes.
+        complete_push_native(push_id, :failed)
 
-    Task.Supervisor.start_child(Mob.Wake.TaskSupervisor, fn ->
-      dispatch_result = Mob.Wake.dispatch(%{identifier: identifier, payload: payload_json})
-      result_atom = push_result_atom(dispatch_result)
-      complete_push_native(push_id, result_atom)
-    end)
+      identifier ->
+        case Task.Supervisor.start_child(Mob.Wake.TaskSupervisor, fn ->
+               dispatch_result =
+                 Mob.Wake.dispatch(%{identifier: identifier, payload: payload_json})
+
+               complete_push_native(push_id, push_result_atom(dispatch_result))
+             end) do
+          {:ok, _pid} ->
+            :ok
+
+          other ->
+            Logger.warning("mob_wake: TaskSupervisor refused push dispatch: #{inspect(other)}")
+            complete_push_native(push_id, :failed)
+        end
+    end
 
     {:noreply, s}
   end
@@ -171,6 +215,23 @@ defmodule Mob.Wake.Registry do
     Logger.info("mob_wake: FCM token received (#{String.length(token)} chars)")
     {:noreply, s}
   end
+
+  # Wake (BGTask / WorkManager) result mapping:
+  #   :ok               — setTaskCompleted(success:true) / Result.success()
+  #   {:ok, :no_data}   — same as :ok. Scheduler triggers don't distinguish
+  #                       :no_data; both are "we ran successfully". Only
+  #                       push cares about the :no_data variant.
+  #   {:error, :retry}  — Android Result.retry() (WorkManager reschedules
+  #                       with backoff). iOS has no retry concept and the
+  #                       ObjC NIF maps :retry → success:false.
+  #   {:error, _}       — setTaskCompleted(success:false) / Result.failure()
+  #
+  # dispatch/1's spec is :ok | {:ok, :no_data} | {:error, term()} — no
+  # other {:ok, _} shape is reachable, so we don't add a catchall for it.
+  defp wake_result_atom(:ok), do: :ok
+  defp wake_result_atom({:ok, :no_data}), do: :ok
+  defp wake_result_atom({:error, :retry}), do: :retry
+  defp wake_result_atom(_), do: :error
 
   defp push_result_atom(:ok), do: :new_data
   defp push_result_atom({:ok, :no_data}), do: :no_data

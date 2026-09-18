@@ -180,9 +180,16 @@ defmodule Mob.Wake do
           last_fired_at: DateTime.utc_now()
         })
 
-        result = run_handler_with_timeout(mfa, payload, timeout_for(trigger))
-        WakeRegistry.update_state(identifier, %{state: :idle})
-        result
+        # try/after so the state flips back to :idle even if
+        # `run_handler_with_timeout` raises for an unexpected reason
+        # (Registry unavailable, Task.Supervisor down, memory pressure).
+        # Without this, state can wedge at :running and status/1 lies
+        # to every future caller.
+        try do
+          run_handler_with_timeout(mfa, payload, timeout_for(trigger))
+        after
+          WakeRegistry.update_state(identifier, %{state: :idle})
+        end
 
       :error ->
         {:error, :unknown_identifier}

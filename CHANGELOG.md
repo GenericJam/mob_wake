@@ -8,6 +8,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+### Fixed — post-review pass on the whole mob_wake epic (2026-09-18)
+
+Adversarial review of every commit today found 10 findings; 4 blockers + 4 real bugs + 2 latent races all fixed in this pass:
+
+- **SECURITY: atom-table exhaustion via push identifier** — `Mob.Wake.Registry.identifier_to_atom/1` now uses `String.to_existing_atom` (was `String.to_atom`). Prior code let a hostile push server mint an unbounded number of atoms from arbitrary payload content and eventually crash the BEAM. Unknown identifiers now log at warn-level and drop; push completes as `:failed` so iOS's opportunistic scheduler doesn't over-invest.
+- **CORRECTNESS: `{:ok, :no_data}` misread as failure on BGTask/WorkManager path** — the wake_fired handler previously flattened `result == :ok` to `:ok` and anything else to `:error`, which mis-reported `{:ok, :no_data}` as `setTaskCompleted(success: false)`. Introduced `wake_result_atom/1` that maps `{:ok, :no_data}` → `:ok`. Over days this would teach iOS to stop firing our tasks.
+- **CORRECTNESS: `{:error, :retry}` never reached WorkManager's `Result.retry()`** — same flatten was collapsing `:retry` → `:error`. The Zig NIF's existing `retryWork` branch was unreachable. `wake_result_atom/1` now preserves `:retry`.
+- **CORRECTNESS: Zig NIF `MAX_ID_LEN=128` silent truncation** — bumped to 256 and now REJECTS identifiers longer than that at the entry rather than silently truncating. A truncated id doesn't match Kotlin's `pendingWork` key; the Worker would hang to its 9-minute timeout.
+- **CORRECTNESS: `std.mem.startsWith` prefix match on Zig atoms** — replaced with an exact-match `atomEquals` helper. Prior code would misclassify a future `:okay` / `:retry_soon` atom as `:ok` / `:retry`.
+- **CORRECTNESS: JNI exception state not cleared after `CallStatic*Method`** — added `clearPendingJniException` after every JNI dispatch. A pending exception makes subsequent JNI calls (including `detachCurrentThread`) undefined behaviour per spec.
+- **RACE: `Task.Supervisor.start_child` return silently ignored** — now matches on `{:ok, _pid}` and on failure logs + completes the OS-side task as `:error` so the platform sees "we tried and couldn't" rather than hanging.
+- **RACE: Kotlin `pendingWork` double-registration** — swap to `putIfAbsent`; concurrent Worker for the same identifier returns `Result.retry()` rather than overwriting the prior deferred (which would leak to the 9-min timeout). Removal now uses atomic `remove(key, expectedValue)` compare-and-remove.
+- **CORRECTNESS: state stays `:running` on unhandled `dispatch/1` error path** — wrapped the handler run in `try/after` so the `:idle` state flip runs even if `run_handler_with_timeout` raises for an unexpected reason (Registry unavailable, etc.).
+- **RESOURCE-LEAK: `enif_alloc_env` NULL return unchecked** in iOS send helpers — now checks and drops silently on OOM, letting the BGTask expirationHandler mark `success:NO` at the OS window.
+
+### Added — regression tests
+- `Mob.Wake.RegistryTest` — atom-table-exhaustion attack simulation: sends a `{:push_fired, ...}` with a never-registered identifier and asserts the atom still doesn't exist afterwards (the core of the security fix).
+- `{:ok, :no_data}` on scheduler path — asserts `dispatch/1` returns the tuple unchanged so `wake_result_atom/1` sees it. Pins the correct mapping.
+- `{:error, :retry}` on scheduler path — same, ensures `Result.retry()` is reachable.
+
 ### Added — MOB-269 identifier + payload schema (mob_push coordination)
 - `MobWake.wake_payload/2` — canonical builder for a `mob_push`-shaped payload. Returns `%{title: " ", body: " ", content_available: true, data: %{"mob_wake_id" => ...}}`. Same shape works for both `MobPush.send(token, :ios, payload)` and `MobPush.send(token, :android, payload)` — one payload, two send calls, no per-platform forking.
 - ADR: `decisions/2026-09-18-identifier-and-payload-schema.md` — anchors the `mob_wake_id` key convention. Any change here breaks receiver routing on both platforms; the ADR names the three sites that must be updated in lockstep (this file, iOS `MobWakeDispatcher.onPushFired:`, Android `MobWakeFcmService.onMessageReceived`).

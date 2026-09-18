@@ -52,8 +52,14 @@ var g_dispatcher_pid_set: bool = false;
 // time from WorkManager per identifier); dropping oldest on overflow is
 // acceptable since the Worker's withTimeoutOrNull await times out with
 // Result.failure() anyway.
+//
+// MAX_ID_LEN sized to accommodate reverse-DNS identifiers with a safe
+// margin. Longer than 255 is invalid per iOS BGTaskScheduler docs and
+// rejected explicitly at the entry rather than silently truncated —
+// truncation was the previous bug: a truncated id doesn't match the
+// Kotlin bridge's pendingWork key, so the Worker hangs to its timeout.
 const MAX_PENDING: usize = 32;
-const MAX_ID_LEN: usize = 128;
+const MAX_ID_LEN: usize = 256;
 var g_pending: [MAX_PENDING][MAX_ID_LEN]u8 = @splat(@splat(0));
 var g_pending_lens: [MAX_PENDING]usize = @splat(0);
 var g_pending_count: usize = 0;
@@ -62,6 +68,29 @@ inline fn detachIfAttached(attached: c_int) void {
     if (attached != 0) {
         if (g_jvm) |jvm| jni.detachCurrentThread(jvm);
     }
+}
+
+// Clears any pending JNI exception AFTER a CallStatic*Method — the JNI
+// spec says subsequent JNI calls are undefined behaviour with a pending
+// exception, including detachCurrentThread. We clear rather than
+// propagate: mob_wake's Kotlin bridge shouldn't throw as part of normal
+// operation, so an exception here is a bug on the Kotlin side that
+// wants a Logcat entry, not a BEAM-side rethrow.
+inline fn clearPendingJniException(jenv: *jni.JNIEnv) void {
+    if (jenv.*.ExceptionCheck.?(jenv) != 0) {
+        jenv.*.ExceptionDescribe.?(jenv);
+        jenv.*.ExceptionClear.?(jenv);
+    }
+}
+
+// Compare a fixed-size atom buffer (null-padded, from enif_get_atom) to
+// a literal target. `startsWith` was previously used — a future
+// `:okay` or `:retry_later` atom would prefix-match `"ok"` / `"retry"`
+// and silently misclassify. Exact match closes that hole.
+inline fn atomEquals(buf: []const u8, target: []const u8) bool {
+    var len: usize = 0;
+    while (len < buf.len and buf[len] != 0) : (len += 1) {}
+    return std.mem.eql(u8, buf[0..len], target);
 }
 
 // ── nativeRegister — Kotlin's static init calls this at first touch ──────
@@ -95,8 +124,13 @@ export fn Java_io_mob_wake_MobWakeBridge_nativeDeliverWake(jenv: *jni.JNIEnv, cl
     const id_c = jenv.*.GetStringUTFChars.?(jenv, id, null) orelse return;
     defer jenv.*.ReleaseStringUTFChars.?(jenv, id, id_c);
 
+    // Measure the identifier fully — no MAX_ID_LEN cap on the walk —
+    // so we can reject rather than truncate. A truncated id doesn't
+    // match the Kotlin bridge's pendingWork key and the Worker hangs
+    // to its 9-minute timeout with the deferred never completing.
     var id_len: usize = 0;
-    while (id_c[id_len] != 0 and id_len < MAX_ID_LEN) : (id_len += 1) {}
+    while (id_c[id_len] != 0) : (id_len += 1) {}
+    if (id_len >= MAX_ID_LEN) return; // too long — drop, Worker times out honestly
 
     if (g_state_mutex == null) return;
     erts.enif_mutex_lock(g_state_mutex);
@@ -253,15 +287,18 @@ fn nif_complete_task(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL
     }
     defer jni.deleteLocalRef(jenv, id_str);
 
-    // :ok → success, :retry → retry, anything else → failure
-    if (std.mem.startsWith(u8, &result_atom, "retry")) {
+    // Exact match on the atom, not prefix — startsWith would misclassify
+    // a future `:okay` / `:retry_soon` / etc. atom.
+    if (atomEquals(&result_atom, "retry")) {
         if (g_wake.retry_work != null) {
             jenv.*.CallStaticVoidMethod.?(jenv, g_wake_cls, g_wake.retry_work, id_str);
+            clearPendingJniException(jenv);
         }
     } else {
-        const success: jni.JBoolean = if (std.mem.startsWith(u8, &result_atom, "ok")) 1 else 0;
+        const success: jni.JBoolean = if (atomEquals(&result_atom, "ok")) 1 else 0;
         if (g_wake.complete_work != null) {
             jenv.*.CallStaticVoidMethod.?(jenv, g_wake_cls, g_wake.complete_work, id_str, success);
+            clearPendingJniException(jenv);
         }
     }
     detachIfAttached(attached);
@@ -284,11 +321,11 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
 
     var charging_atom: [8]u8 = @splat(0);
     if (erts.enif_get_atom(env, argv[3], &charging_atom, charging_atom.len, erts.ERL_NIF_LATIN1) == 0) return erts.badarg(env);
-    const charging: jni.JBoolean = if (std.mem.startsWith(u8, &charging_atom, "true")) 1 else 0;
+    const charging: jni.JBoolean = if (atomEquals(&charging_atom, "true")) 1 else 0;
 
     var unmetered_atom: [8]u8 = @splat(0);
     if (erts.enif_get_atom(env, argv[4], &unmetered_atom, unmetered_atom.len, erts.ERL_NIF_LATIN1) == 0) return erts.badarg(env);
-    const unmetered: jni.JBoolean = if (std.mem.startsWith(u8, &unmetered_atom, "true")) 1 else 0;
+    const unmetered: jni.JBoolean = if (atomEquals(&unmetered_atom, "true")) 1 else 0;
 
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse {
@@ -311,6 +348,7 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
     defer jni.deleteLocalRef(jenv, trg_str);
 
     const ok = jenv.*.CallStaticBooleanMethod.?(jenv, g_wake_cls, g_wake.schedule_work, id_str, trg_str, @as(jni.JLong, earliest_ms), charging, unmetered);
+    clearPendingJniException(jenv);
     detachIfAttached(attached);
     if (ok == 0) {
         return erts.tuple2(env, erts.atom(env, "error"), erts.atom(env, "submit_failed"));
@@ -363,6 +401,7 @@ fn nif_platform_signal(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.E
         return erts.enif_make_new_map(env);
     }
     const bits = jenv.*.CallStaticLongMethod.?(jenv, g_wake_cls, g_wake.platform_signal);
+    clearPendingJniException(jenv);
     detachIfAttached(attached);
 
     const battery_optimized: bool = (bits & 0b01) != 0;

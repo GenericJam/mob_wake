@@ -119,7 +119,21 @@ object MobWakeBridge {
     /** Called by MobWakeWorker to hand control to BEAM and await result. */
     suspend fun awaitBeamDispatch(identifier: String): ListenableWorker.Result {
         val deferred = CompletableDeferred<ListenableWorker.Result>()
-        pendingWork[identifier] = deferred
+
+        // putIfAbsent so a concurrent Worker for the same identifier
+        // can't overwrite an in-flight deferred. WorkManager's
+        // ExistingWorkPolicy.REPLACE normally prevents this — but
+        // during a replace, the outgoing Worker's doWork may still be
+        // running while the incoming one starts. Losing the outgoing
+        // deferred would leak it to the 9-minute timeout without ever
+        // being completed by Elixir.
+        val prior = pendingWork.putIfAbsent(identifier, deferred)
+        if (prior != null) {
+            // Existing dispatch in flight for this identifier. Tell
+            // WorkManager to retry us — by then the prior one should
+            // have completed and released the slot.
+            return ListenableWorker.Result.retry()
+        }
 
         // Ship to BEAM. The Zig thunk either enif_sends immediately or
         // queues for BEAM to drain at boot; either way the deferred
@@ -130,7 +144,11 @@ object MobWakeBridge {
         // upper bound for a single Worker, so we surface a timeout
         // before WorkManager kills us and mis-attributes the failure.
         val result = withTimeoutOrNull(9L * 60L * 1000L) { deferred.await() }
-        pendingWork.remove(identifier)
+        // Remove ONLY if the entry is still this deferred — completeWork
+        // may already have removed it. remove(key, expectedValue) is
+        // the atomic compare-and-remove; a mismatch means someone else
+        // already completed us and we shouldn't clobber their state.
+        pendingWork.remove(identifier, deferred)
         return result ?: ListenableWorker.Result.failure()
     }
 

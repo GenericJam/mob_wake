@@ -80,8 +80,15 @@ static ERL_NIF_TERM nsstring_to_bin(ErlNifEnv *env, NSString *s) {
 }
 
 // Local send helper: {:wake_fired, identifier :: binary}
+//
+// enif_alloc_env can return NULL under memory pressure; dereferencing
+// it in enif_make_tuple2 crashes the BEAM. On failure we silently drop —
+// the BGTask expirationHandler will pick up the drop at the OS window
+// and mark success:false, which is the honest signal (we couldn't
+// deliver).
 static void send_wake_fired(ErlNifPid *pid, NSString *identifier) {
   ErlNifEnv *env = enif_alloc_env();
+  if (env == NULL) return;
   ERL_NIF_TERM msg = enif_make_tuple2(env,
                                       enif_make_atom(env, "wake_fired"),
                                       nsstring_to_bin(env, identifier));
@@ -96,6 +103,7 @@ static void send_wake_fired(ErlNifPid *pid, NSString *identifier) {
 static void send_push_fired(ErlNifPid *pid, NSString *identifier,
                              NSString *push_id, NSString *payload_json) {
   ErlNifEnv *env = enif_alloc_env();
+  if (env == NULL) return;
   ERL_NIF_TERM msg = enif_make_tuple4(env,
                                       enif_make_atom(env, "push_fired"),
                                       nsstring_to_bin(env, identifier),

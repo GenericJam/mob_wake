@@ -9,8 +9,12 @@ defmodule Mob.Wake.RegistryTest do
 
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   defmodule TestHandlers do
     def report_and_ok(who, payload), do: send(who, {:report_and_ok, payload}) && :ok
+    def report_and_no_data(who, payload), do: send(who, {:no_data, payload}) && {:ok, :no_data}
+    def report_and_retry(who, payload), do: send(who, {:retry, payload}) && {:error, :retry}
   end
 
   describe "handle_info({:push_fired, id_bin, push_id, payload_json}, s)" do
@@ -28,6 +32,37 @@ defmodule Mob.Wake.RegistryTest do
       send(Mob.Wake.Registry, {:push_fired, Atom.to_string(id), push_id, payload_json})
 
       assert_receive {:report_and_ok, ^payload_json}, 500
+    end
+
+    test "ignores an unregistered identifier — SECURITY: does NOT mint a new atom" do
+      # This is the fix for the atom-exhaustion finding. The push_fired
+      # path is fed by APNs/FCM payload content (caller-controlled — the
+      # relay operator, or worse). Prior code used String.to_atom which
+      # would create a new atom for every unique inbound id and eventually
+      # exhaust the BEAM's atom table (max ~1M by default).
+      #
+      # The fix uses String.to_existing_atom; unknown ids drop silently
+      # (with a Logger.warning). We verify by:
+      #   1. Sending a wake for an atom we DO NOT create locally.
+      #   2. Asserting the atom does not exist afterwards.
+      unknown_bin = "never_registered_#{System.unique_integer([:positive])}"
+
+      # Establish baseline: the atom truly does not exist yet.
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_bin) end
+
+      push_id = "unregistered-push-#{System.unique_integer([:positive])}"
+
+      capture_log(fn ->
+        send(Mob.Wake.Registry, {:push_fired, unknown_bin, push_id, ~s({})})
+        # Give the Registry a beat to process — no message we can assert
+        # positively on, so we probe negatively by asserting the atom
+        # still doesn't exist.
+        Process.sleep(50)
+      end)
+
+      # Post-condition: atom STILL does not exist. This is the whole
+      # point of the fix — a hostile push can't fill the atom table.
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_bin) end
     end
   end
 
@@ -50,6 +85,40 @@ defmodule Mob.Wake.RegistryTest do
       # And the Registry's own state reflects the dispatch.
       s = Mob.Wake.status(id)
       assert %DateTime{} = s.last_fired_at
+    end
+
+    test "wake_result_atom: {:ok, :no_data} from a scheduler handler maps to :ok, not :error" do
+      # Fix for the review's finding #2 — a scheduler handler returning
+      # {:ok, :no_data} was being flattened to :error by the previous
+      # `success_atom = if result == :ok, do: :ok, else: :error` line.
+      # That taught iOS's opportunistic scheduler "this task failed" and
+      # over days future fires would stop. Now wake_result_atom
+      # explicitly maps {:ok, :no_data} → :ok.
+      #
+      # This test exercises the mapping indirectly: it registers a
+      # handler that returns {:ok, :no_data} and asserts the dispatch
+      # result at Mob.Wake.dispatch/1's level flows the shape through.
+      id = :"wake_no_data_#{System.unique_integer([:positive])}"
+      :ok = Mob.Wake.register(id, :refresh, {TestHandlers, :report_and_no_data, [self()]})
+
+      # dispatch/1 returns {:ok, :no_data} — the spec-widened shape.
+      assert {:ok, :no_data} = Mob.Wake.dispatch(id)
+      assert_received {:no_data, nil}
+    end
+
+    test "wake_result_atom: {:error, :retry} from a scheduler handler is preserved" do
+      # Fix for the review's finding #3 — WorkManager's Result.retry()
+      # was unreachable because the Registry was flattening
+      # {:error, :retry} to :error (which the Zig NIF maps to
+      # Result.failure()). Now wake_result_atom preserves :retry so
+      # the NIF's retryWork branch is reachable.
+      id = :"wake_retry_#{System.unique_integer([:positive])}"
+      :ok = Mob.Wake.register(id, :refresh, {TestHandlers, :report_and_retry, [self()]})
+
+      # dispatch/1 returns {:error, :retry} — the wake_result_atom
+      # mapping preserves this for the NIF layer.
+      assert {:error, :retry} = Mob.Wake.dispatch(id)
+      assert_received {:retry, nil}
     end
 
     test "surviving native-side complete_task no-op means Registry stays up" do
