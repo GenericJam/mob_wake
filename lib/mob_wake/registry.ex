@@ -126,11 +126,12 @@ defmodule Mob.Wake.Registry do
 
   @impl true
   def handle_info({:wake_fired, identifier}, s) when is_atom(identifier) do
-    # Native side pushed this — dispatch under the task supervisor so
-    # a slow handler doesn't back up further wake events. `complete_task`
-    # feeds iOS's setTaskCompleted(success:); success argument matches
-    # the honest-reliability discipline — iOS's opportunistic scheduler
-    # LEARNS from these, so lying degrades future fires.
+    # Native BGTask fire (MOB-261). Dispatch under the task supervisor
+    # so a slow handler doesn't back up further wake events.
+    # `complete_task` feeds iOS's setTaskCompleted(success:); success
+    # argument matches the honest-reliability discipline — iOS's
+    # opportunistic scheduler LEARNS from these, so lying degrades
+    # future fires.
     Task.Supervisor.start_child(Mob.Wake.TaskSupervisor, fn ->
       result = Mob.Wake.dispatch(identifier)
       success_atom = if result == :ok, do: :ok, else: :error
@@ -140,8 +141,39 @@ defmodule Mob.Wake.Registry do
     {:noreply, s}
   end
 
+  def handle_info({:push_fired, identifier_bin, push_id, payload_json}, s)
+      when is_binary(identifier_bin) and is_binary(push_id) and is_binary(payload_json) do
+    # Native silent-APNs fire (MOB-262). Payload is delivered as JSON
+    # binary to keep mob_wake out of the JSON-library-dep business —
+    # handlers decode with Jason / :json / their choice. dispatch's
+    # return maps to UIBackgroundFetchResult via `complete_push`:
+    #   :ok               → :new_data  (iOS learns push was worthwhile)
+    #   {:ok, :no_data}   → :no_data   (routed but no new data fetched)
+    #   {:error, _}       → :failed
+    identifier = identifier_to_atom(identifier_bin)
+
+    Task.Supervisor.start_child(Mob.Wake.TaskSupervisor, fn ->
+      dispatch_result = Mob.Wake.dispatch(%{identifier: identifier, payload: payload_json})
+      result_atom = push_result_atom(dispatch_result)
+      complete_push_native(push_id, result_atom)
+    end)
+
+    {:noreply, s}
+  end
+
+  defp push_result_atom(:ok), do: :new_data
+  defp push_result_atom({:ok, :no_data}), do: :no_data
+  defp push_result_atom(_), do: :failed
+
   defp complete_native(identifier, success_atom) do
     :mob_wake_nif.complete_task(Atom.to_string(identifier), success_atom)
+  catch
+    :error, :undef -> :ok
+    :error, :nif_not_loaded -> :ok
+  end
+
+  defp complete_push_native(push_id, result_atom) do
+    :mob_wake_nif.complete_push(push_id, result_atom)
   catch
     :error, :undef -> :ok
     :error, :nif_not_loaded -> :ok

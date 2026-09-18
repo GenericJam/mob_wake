@@ -13,6 +13,24 @@ defmodule Mob.Wake.RegistryTest do
     def report_and_ok(who, payload), do: send(who, {:report_and_ok, payload}) && :ok
   end
 
+  describe "handle_info({:push_fired, id_bin, push_id, payload_json}, s)" do
+    test "dispatches with the payload JSON binary as the handler arg" do
+      # Silent-APNs wire delivers payload as a JSON binary (the NIF
+      # NSJSONSerialization output). The Elixir side dispatches the
+      # payload through unchanged — handlers Jason.decode! or :json.decode
+      # themselves. This test asserts that arrival shape.
+      id = :"push_dispatch_#{System.unique_integer([:positive])}"
+      :ok = Mob.Wake.register(id, :push, {TestHandlers, :report_and_ok, [self()]})
+
+      payload_json = ~s({"peer":"abc","count":1})
+      push_id = "test-push-#{System.unique_integer([:positive])}"
+
+      send(Mob.Wake.Registry, {:push_fired, Atom.to_string(id), push_id, payload_json})
+
+      assert_receive {:report_and_ok, ^payload_json}, 500
+    end
+  end
+
   describe "handle_info({:wake_fired, id}, s)" do
     test "dispatches the identifier under the Task.Supervisor" do
       # Register a handler that pings this test process so we can

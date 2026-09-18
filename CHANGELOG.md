@@ -8,6 +8,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+### Added — MOB-262 iOS silent APNs receive
+- `mob_wake_nif.m` gains two entry points: `+onPushFired:completionHandler:` (ObjC, called from AppDelegate's `didReceiveRemoteNotification:fetchCompletionHandler:`) and `complete_push/2` NIF (Elixir → native → `UIBackgroundFetchResult` completion).
+- Native `g_push_completions` table keyed by `NSUUID` string per push (multiple simultaneous pushes for the same identifier are supported, unlike BGTasks where one identifier maps to one fire in flight).
+- APNs payload is serialised to a JSON binary via `NSJSONSerialization` and delivered to Elixir as-is — mob_wake doesn't take on a JSON-library dep, handlers decode themselves.
+- Payload routing: top-level `mob_wake_id` key in userInfo names the identifier. Pushes without it get `.noData` back to iOS (so the opportunistic scheduler doesn't overinvest).
+- `Mob.Wake.Registry.handle_info({:push_fired, id_bin, push_id, payload_json}, _)` — spawns dispatch under `Mob.Wake.TaskSupervisor` and maps result to `UIBackgroundFetchResult`: `:ok` → `.new_data`, `{:ok, :no_data}` → `.no_data`, `{:error, _}` → `.failed`.
+- README AppDelegate snippet extended with the silent-APNs handler + `UIBackgroundModes` `remote-notification` + server-side payload shape.
+
+### Known limitation
+- Cold-start-via-push (BEAM not yet up when the push arrives) fails fast with `.failed` rather than queueing. Silent APNs has a ~30s completion window that would frequently miss a cold BEAM boot; failing fast lets the sender's server see the miss clearly. A follow-up can add push queueing with a native timer if the cold-start-via-push case turns out to matter for real workloads.
+
 ### Added — MOB-261 iOS BGTaskScheduler NIF
 - `priv/native/ios/mob_wake_nif.m` — ObjC NIF wrapping `BGTaskScheduler`. Four entry points: `set_dispatcher_pid/1`, `take_pending_wakes/0`, `complete_task/2`, `schedule/3`.
 - Native-side state (mutex-guarded, mirrors mob's `g_launch_notification_json` pattern): dispatcher pid, `BGTask*` table keyed by identifier, pending-wake queue for cold-start-into-background firings.

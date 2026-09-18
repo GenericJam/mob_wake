@@ -98,6 +98,16 @@ if (@available(iOS 13.0, *)) {
   [MobWakeDispatcher registerTaskWithIdentifier:@"com.myapp.sync_notes" trigger:@"refresh"];
   [MobWakeDispatcher registerTaskWithIdentifier:@"com.myapp.cleanup"    trigger:@"processing"];
 }
+
+// For silent APNs (:push-triggered identifiers), also add:
+- (void)application:(UIApplication *)application
+    didReceiveRemoteNotification:(NSDictionary *)userInfo
+        fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
+  // mob_wake routes on the top-level "mob_wake_id" key in userInfo.
+  // Your server's silent-push payload MUST include it (mob_push, when
+  // shipped, will enforce this convention on the send side).
+  [MobWakeDispatcher onPushFired:userInfo completionHandler:completionHandler];
+}
 ```
 
 And in your `Info.plist`, add each identifier to `BGTaskSchedulerPermittedIdentifiers`:
@@ -110,10 +120,23 @@ And in your `Info.plist`, add each identifier to `BGTaskSchedulerPermittedIdenti
 </array>
 <key>UIBackgroundModes</key>
 <array>
-  <string>fetch</string>       <!-- for :refresh triggers -->
-  <string>processing</string>  <!-- for :processing triggers -->
+  <string>fetch</string>                 <!-- for :refresh triggers -->
+  <string>processing</string>            <!-- for :processing triggers -->
+  <string>remote-notification</string>   <!-- for :push triggers -->
 </array>
 ```
+
+For silent APNs, the server-side payload must include a top-level `mob_wake_id` key naming the identifier, plus `aps.content-available: 1`:
+
+```json
+{
+  "aps": { "content-available": 1 },
+  "mob_wake_id": "com.myapp.sync_from_peer",
+  "peer": "abc"
+}
+```
+
+`Mob.Wake.dispatch/1` will invoke the registered handler with the whole payload as a JSON binary — decode with `Jason.decode!/1` or `:json.decode/1` (Elixir 1.18+) in your handler if you want a map.
 
 ## Public API
 

@@ -54,7 +54,7 @@
 #import <BackgroundTasks/BackgroundTasks.h>
 #include <erl_nif.h>
 
-// Single mutex covering the three globals. Guarded lazily — a call
+// Single mutex covering all five globals. Guarded lazily — a call
 // arriving before `nif_load` created the mutex is fine (we no-op the
 // enqueue and let the BGTask expire; the scenario is a launchHandler
 // firing before the app has loaded any NIF, which shouldn't happen).
@@ -63,18 +63,44 @@ static ErlNifPid g_dispatcher_pid;
 static BOOL g_dispatcher_pid_set = NO;
 static NSMutableDictionary<NSString *, BGTask *> *g_bg_tasks = nil;
 static NSMutableArray<NSString *> *g_pending_wakes = nil;
+// Silent-APNs completions live in their own table keyed by push_id
+// (NSUUID string) rather than the wake identifier — multiple pushes
+// for the same identifier can arrive in flight, unlike BGTasks where
+// only one fires per identifier at a time.
+static NSMutableDictionary<NSString *, void (^)(UIBackgroundFetchResult)> *g_push_completions = nil;
+
+// Build a binary term from an NSString.
+static ERL_NIF_TERM nsstring_to_bin(ErlNifEnv *env, NSString *s) {
+  const char *bytes = [s UTF8String];
+  size_t len = strlen(bytes);
+  ERL_NIF_TERM bin;
+  unsigned char *raw = enif_make_new_binary(env, len, &bin);
+  if (raw != NULL) memcpy(raw, bytes, len);
+  return bin;
+}
 
 // Local send helper: {:wake_fired, identifier :: binary}
 static void send_wake_fired(ErlNifPid *pid, NSString *identifier) {
   ErlNifEnv *env = enif_alloc_env();
-  const char *bytes = [identifier UTF8String];
-  size_t len = strlen(bytes);
-  ERL_NIF_TERM id_bin;
-  unsigned char *raw = enif_make_new_binary(env, len, &id_bin);
-  if (raw != NULL) {
-    memcpy(raw, bytes, len);
-  }
-  ERL_NIF_TERM msg = enif_make_tuple2(env, enif_make_atom(env, "wake_fired"), id_bin);
+  ERL_NIF_TERM msg = enif_make_tuple2(env,
+                                      enif_make_atom(env, "wake_fired"),
+                                      nsstring_to_bin(env, identifier));
+  enif_send(NULL, pid, env, msg);
+  enif_free_env(env);
+}
+
+// Local send helper: {:push_fired, identifier :: binary, push_id :: binary, payload_json :: binary}
+// The payload arrives as the userInfo dict JSON-serialised; the Elixir
+// side can decode further if it cares. Keeping it as a JSON binary
+// avoids pulling a JSON library into mob_wake's runtime deps.
+static void send_push_fired(ErlNifPid *pid, NSString *identifier,
+                             NSString *push_id, NSString *payload_json) {
+  ErlNifEnv *env = enif_alloc_env();
+  ERL_NIF_TERM msg = enif_make_tuple4(env,
+                                      enif_make_atom(env, "push_fired"),
+                                      nsstring_to_bin(env, identifier),
+                                      nsstring_to_bin(env, push_id),
+                                      nsstring_to_bin(env, payload_json));
   enif_send(NULL, pid, env, msg);
   enif_free_env(env);
 }
@@ -84,6 +110,13 @@ static void send_wake_fired(ErlNifPid *pid, NSString *identifier) {
 @interface MobWakeDispatcher : NSObject
 + (void)registerTaskWithIdentifier:(NSString *)identifier trigger:(NSString *)trigger;
 + (void)onTaskFired:(BGTask *)task;
+// Silent APNs entry (MOB-262). Call from AppDelegate's
+// `application:didReceiveRemoteNotification:fetchCompletionHandler:`.
+// Requires userInfo to carry a top-level "mob_wake_id" (NSString) key;
+// pushes without it are ignored and the completionHandler is called
+// with .noData so iOS learns not to prioritise them.
++ (void)onPushFired:(NSDictionary *)userInfo
+    completionHandler:(void (^)(UIBackgroundFetchResult))completionHandler;
 @end
 
 @implementation MobWakeDispatcher
@@ -163,6 +196,72 @@ static void send_wake_fired(ErlNifPid *pid, NSString *identifier) {
   // Not-set path: BEAM will drain via take_pending_wakes/0 when it's up.
   // The BGTask stays in g_bg_tasks until complete_task/2 fires or the
   // expirationHandler above collects it.
+}
+
++ (void)onPushFired:(NSDictionary *)userInfo
+    completionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
+  // MOB-262 minimal path. Cold-start-via-push (BEAM not yet up) is NOT
+  // queued — silent APNs has a ~30s completion window that would
+  // frequently miss a cold BEAM boot, so we fail fast here rather than
+  // leave the user's server thinking the push landed. Cold-start-via-push
+  // is a follow-up concern; the common case is a running app.
+  NSString *identifier = userInfo[@"mob_wake_id"];
+  if (![identifier isKindOfClass:[NSString class]] || identifier.length == 0) {
+    // No routing information — call .noData so iOS's opportunistic
+    // scheduler doesn't over-invest in future silent pushes for us.
+    completionHandler(UIBackgroundFetchResultNoData);
+    return;
+  }
+
+  if (g_mutex == NULL) {
+    // NIF not loaded — can't reach BEAM at all.
+    completionHandler(UIBackgroundFetchResultFailed);
+    return;
+  }
+
+  ErlNifPid pid_snapshot;
+  BOOL pid_valid;
+
+  enif_mutex_lock(g_mutex);
+  pid_valid = g_dispatcher_pid_set;
+  if (pid_valid) pid_snapshot = g_dispatcher_pid;
+  enif_mutex_unlock(g_mutex);
+
+  if (!pid_valid) {
+    // BEAM not yet ready — fail fast rather than queue with a race
+    // against the ~30s window. This is the documented limitation.
+    completionHandler(UIBackgroundFetchResultFailed);
+    return;
+  }
+
+  // Serialize userInfo to JSON so the Elixir side sees the full payload
+  // without us having to build a nested map term-by-term in ObjC.
+  // NSJSONSerialization rejects some NSObject values (dates, data) but
+  // silent-APNs payloads are HTTP-JSON — the round-trip is safe.
+  NSError *jerr = nil;
+  NSData *json = [NSJSONSerialization dataWithJSONObject:userInfo
+                                                  options:0
+                                                    error:&jerr];
+  NSString *payload_json;
+  if (json != nil) {
+    payload_json = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+  } else {
+    // Extremely rare — the payload didn't survive JSON round-trip.
+    // Fall back to an empty object so the Elixir side sees a
+    // decodable but empty payload; the identifier is what matters.
+    payload_json = @"{}";
+  }
+
+  NSString *push_id = [[NSUUID UUID] UUIDString];
+
+  enif_mutex_lock(g_mutex);
+  if (g_push_completions == nil) g_push_completions = [NSMutableDictionary new];
+  // Copy the block so its stack captures survive; APNs completion
+  // blocks are typically already heap-allocated but copying is cheap.
+  g_push_completions[push_id] = [completionHandler copy];
+  enif_mutex_unlock(g_mutex);
+
+  send_push_fired(&pid_snapshot, identifier, push_id, payload_json);
 }
 
 @end
@@ -245,6 +344,55 @@ static ERL_NIF_TERM nif_complete_task(ErlNifEnv *env, int argc,
   }
 
   [task setTaskCompletedWithSuccess:success];
+  return enif_make_atom(env, "ok");
+}
+
+// ── NIF: complete_push ──────────────────────────────────────────────
+
+static ERL_NIF_TERM nif_complete_push(ErlNifEnv *env, int argc,
+                                       const ERL_NIF_TERM argv[]) {
+  // complete_push(push_id :: binary, result :: :new_data | :no_data | :failed)
+  ErlNifBinary id_bin;
+  if (!enif_inspect_binary(env, argv[0], &id_bin) &&
+      !enif_inspect_iolist_as_binary(env, argv[0], &id_bin)) {
+    return enif_make_badarg(env);
+  }
+  char result_atom[16] = {0};
+  if (!enif_get_atom(env, argv[1], result_atom, sizeof(result_atom), ERL_NIF_LATIN1)) {
+    return enif_make_badarg(env);
+  }
+
+  UIBackgroundFetchResult result_val;
+  if (strncmp(result_atom, "new_data", 9) == 0) {
+    result_val = UIBackgroundFetchResultNewData;
+  } else if (strncmp(result_atom, "no_data", 8) == 0) {
+    result_val = UIBackgroundFetchResultNoData;
+  } else if (strncmp(result_atom, "failed", 7) == 0) {
+    result_val = UIBackgroundFetchResultFailed;
+  } else {
+    return enif_make_badarg(env);
+  }
+
+  NSString *push_id = [[NSString alloc] initWithBytes:id_bin.data
+                                                length:id_bin.size
+                                              encoding:NSUTF8StringEncoding];
+  if (push_id == nil) return enif_make_badarg(env);
+
+  void (^completion)(UIBackgroundFetchResult);
+  enif_mutex_lock(g_mutex);
+  completion = g_push_completions[push_id];
+  if (completion != nil) [g_push_completions removeObjectForKey:push_id];
+  enif_mutex_unlock(g_mutex);
+
+  if (completion == nil) {
+    // Push already completed, or complete_push was called for a push
+    // that never happened. Report so Elixir sees the truth.
+    return enif_make_tuple2(env,
+                            enif_make_atom(env, "error"),
+                            enif_make_atom(env, "no_such_push"));
+  }
+
+  completion(result_val);
   return enif_make_atom(env, "ok");
 }
 
@@ -346,6 +494,7 @@ static ErlNifFunc nif_funcs[] = {
     {"set_dispatcher_pid",  1, nif_set_dispatcher_pid,  0},
     {"take_pending_wakes",  0, nif_take_pending_wakes,  0},
     {"complete_task",       2, nif_complete_task,       0},
+    {"complete_push",       2, nif_complete_push,       0},
     {"schedule",            3, nif_schedule,            0},
 };
 
