@@ -23,7 +23,14 @@ defmodule MobWake.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger]]
+    # The plugin boots its own supervision tree (Registry + Task.Supervisor)
+    # via MobWake.Application. Standard OTP: any host app depending on
+    # :mob_wake picks this up through the application dependency graph and
+    # starts the tree before Mob.Wake.dispatch/1 is callable.
+    [
+      extra_applications: [:logger],
+      mod: {MobWake.Application, []}
+    ]
   end
 
   defp aliases do
