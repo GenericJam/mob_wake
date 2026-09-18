@@ -9,10 +9,13 @@
   # background handlers when the OS wakes us. A host app that wants to see
   # the wake state visually renders it themselves via `Mob.Wake.status/1`.
   screens: [],
-  # NIFs land per-issue as MOB-261..264 implement each trigger path. Kept
-  # explicit-empty so a future validator that requires the key finds it
-  # rather than silently defaulting to something else.
-  nifs: [],
+  nifs: [
+    # iOS: BGTaskScheduler + silent APNs receive (MOB-261 + MOB-262).
+    # Compiled as ObjC (-fobjc-arc) via the plugin objc-NIF path.
+    # Absent on non-iOS builds (platform: :ios). Android's WorkManager +
+    # FCM NIF (MOB-263/264) will land as a separate zig NIF here.
+    %{module: :mob_wake_nif, native_dir: "priv/native/ios", lang: :objc, platform: :ios}
+  ],
   android: %{
     permissions: [
       # Post-only permission for a notification the app might raise from

@@ -8,7 +8,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
-Nothing yet — next in flight is MOB-261 (iOS BGTaskScheduler NIF).
+### Added — MOB-261 iOS BGTaskScheduler NIF
+- `priv/native/ios/mob_wake_nif.m` — ObjC NIF wrapping `BGTaskScheduler`. Four entry points: `set_dispatcher_pid/1`, `take_pending_wakes/0`, `complete_task/2`, `schedule/3`.
+- Native-side state (mutex-guarded, mirrors mob's `g_launch_notification_json` pattern): dispatcher pid, `BGTask*` table keyed by identifier, pending-wake queue for cold-start-into-background firings.
+- `MobWakeDispatcher` ObjC class — `+registerTaskWithIdentifier:trigger:` for `AppDelegate` to call at `didFinishLaunchingWithOptions`; `+onTaskFired:` is the launchHandler forwarder.
+- `Mob.Wake.Registry` init handoff: `set_dispatcher_pid(self())` + drains `take_pending_wakes()`, all catches-guarded so host + Android-only builds still boot cleanly.
+- `Mob.Wake.Registry.handle_info({:wake_fired, id}, _)` — spawns a task under `Mob.Wake.TaskSupervisor` that runs `dispatch/1` and calls `complete_task/2` so iOS's `setTaskCompleted(success:)` reflects the true return.
+- `expirationHandler` on every `BGTask` — if iOS cancels early we `setTaskCompletedWithSuccess:NO` and drop the reference under the mutex; no dangling task pointer.
+- Manifest declares the ObjC NIF (`platform: :ios`, `lang: :objc`).
+- README AppDelegate snippet — the hand-wired integration until MOB-265's codegen lands.
+- 2 registry tests exercising the `{:wake_fired, id}` handler through `Task.Supervisor` on host (NIF absent, catches hold, dispatch runs).
+
+### Notes
+- Not physical-device verified yet — that's MOB-268's dedicated harness.
+- `schedule/3` ignores the `opts` keyword list (TODO: parse `:earliest`, constraints on `:processing`). Marked in the NIF source.
+- Android side (MOB-263/264) still absent; NIF calls from Elixir Registry catch cleanly on those builds.
 
 ## [0.1.0] - 2026-09-18
 

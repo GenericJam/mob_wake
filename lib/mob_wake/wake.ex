@@ -265,12 +265,17 @@ defmodule Mob.Wake do
   defp invoke({m, f}, payload), do: apply(m, f, [payload])
   defp invoke({m, f, extra_args}, payload), do: apply(m, f, extra_args ++ [payload])
 
-  # Native scheduler entry points. NIFs land in MOB-261 (iOS) and MOB-263
-  # (Android). Until then the catch collapses cleanly and reports
-  # :not_yet_implemented so callers see a clear signal rather than a
-  # generic FunctionClauseError.
+  # Native scheduler entry points. iOS NIF landed in MOB-261; Android
+  # NIF lands in MOB-263. Until Android is up, the catch reports
+  # :not_yet_implemented on that platform so callers see a clear signal
+  # rather than a generic FunctionClauseError.
+  #
+  # The NIF expects the identifier as a binary — atoms don't cross the
+  # native boundary as nicely (enif_get_atom with a small buffer is a
+  # foot-gun for identifiers of arbitrary length). Convert once at the
+  # seam.
   defp do_schedule(identifier, trigger, opts) do
-    :mob_wake_nif.schedule(identifier, trigger, opts)
+    :mob_wake_nif.schedule(Atom.to_string(identifier), trigger, opts)
   catch
     :error, :undef -> {:error, :not_yet_implemented}
     :error, :nif_not_loaded -> {:error, :not_yet_implemented}

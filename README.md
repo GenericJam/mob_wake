@@ -80,6 +80,41 @@ defmodule MyApp.BackgroundJobs do
 end
 ```
 
+## AppDelegate wiring (iOS, until MOB-265 codegen lands)
+
+Until `mob_new`'s codegen (MOB-265) writes this automatically from your `config :mob_wake, :tasks` table, add the following to your generated `ios/AppDelegate.m`:
+
+```objc
+// Near the top of the file:
+#import <BackgroundTasks/BackgroundTasks.h>
+@interface MobWakeDispatcher : NSObject
++ (void)registerTaskWithIdentifier:(NSString *)identifier trigger:(NSString *)trigger;
+@end
+
+// Inside `application:didFinishLaunchingWithOptions:`, BEFORE `return YES;`:
+if (@available(iOS 13.0, *)) {
+  // One line per identifier in your `config :mob_wake, :tasks`. iOS
+  // rejects registration attempted after `didFinishLaunching` returns.
+  [MobWakeDispatcher registerTaskWithIdentifier:@"com.myapp.sync_notes" trigger:@"refresh"];
+  [MobWakeDispatcher registerTaskWithIdentifier:@"com.myapp.cleanup"    trigger:@"processing"];
+}
+```
+
+And in your `Info.plist`, add each identifier to `BGTaskSchedulerPermittedIdentifiers`:
+
+```xml
+<key>BGTaskSchedulerPermittedIdentifiers</key>
+<array>
+  <string>com.myapp.sync_notes</string>
+  <string>com.myapp.cleanup</string>
+</array>
+<key>UIBackgroundModes</key>
+<array>
+  <string>fetch</string>       <!-- for :refresh triggers -->
+  <string>processing</string>  <!-- for :processing triggers -->
+</array>
+```
+
 ## Public API
 
 Under the `Mob.Wake` namespace. Full contract in the module's @moduledoc.

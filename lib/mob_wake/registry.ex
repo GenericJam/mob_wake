@@ -23,6 +23,12 @@ defmodule Mob.Wake.Registry do
 
   require Logger
 
+  # :mob_wake_nif is defined by the iOS/Android NIFs at build time (MOB-261
+  # onwards). On host and iOS-below-13/Android-without-GMS the module is
+  # absent — the wire-up below catches :undef and no-ops so tests + host
+  # dev work fine.
+  @compile {:no_warn_undefined, :mob_wake_nif}
+
   @table __MODULE__
 
   @typedoc """
@@ -95,7 +101,50 @@ defmodule Mob.Wake.Registry do
     ])
 
     seed_from_config()
+    handoff_native()
     {:ok, %{}}
+  end
+
+  # Wire this GenServer to the native NIF as the dispatcher pid and
+  # drain any wakes queued while BEAM was cold. Catches :undef when the
+  # NIF isn't loaded (host, iOS-below-13, non-iOS in the interim before
+  # MOB-263's Android side lands) — the Registry still boots.
+  defp handoff_native do
+    :mob_wake_nif.set_dispatcher_pid(self())
+
+    :mob_wake_nif.take_pending_wakes()
+    |> Enum.each(fn identifier ->
+      send(self(), {:wake_fired, identifier_to_atom(identifier)})
+    end)
+  catch
+    :error, :undef -> :ok
+    :error, :nif_not_loaded -> :ok
+  end
+
+  defp identifier_to_atom(bin) when is_binary(bin), do: String.to_atom(bin)
+  defp identifier_to_atom(atom) when is_atom(atom), do: atom
+
+  @impl true
+  def handle_info({:wake_fired, identifier}, s) when is_atom(identifier) do
+    # Native side pushed this — dispatch under the task supervisor so
+    # a slow handler doesn't back up further wake events. `complete_task`
+    # feeds iOS's setTaskCompleted(success:); success argument matches
+    # the honest-reliability discipline — iOS's opportunistic scheduler
+    # LEARNS from these, so lying degrades future fires.
+    Task.Supervisor.start_child(Mob.Wake.TaskSupervisor, fn ->
+      result = Mob.Wake.dispatch(identifier)
+      success_atom = if result == :ok, do: :ok, else: :error
+      complete_native(identifier, success_atom)
+    end)
+
+    {:noreply, s}
+  end
+
+  defp complete_native(identifier, success_atom) do
+    :mob_wake_nif.complete_task(Atom.to_string(identifier), success_atom)
+  catch
+    :error, :undef -> :ok
+    :error, :nif_not_loaded -> :ok
   end
 
   @impl true
