@@ -88,6 +88,34 @@ object MobWakeBridge {
         nativeDeliverFcmToken(token)
     }
 
+    /**
+     * Called from the Zig NIF's platform_signal thunk. Returns two flags:
+     *
+     *   * `batteryOptimized` — true if the app is subject to Android's
+     *     battery-optimization list (i.e. OS may throttle background
+     *     work aggressively). false when the user has whitelisted us via
+     *     Settings → Battery → Battery Optimization → not-optimized.
+     *   * `hasContext` — false when the bridge hasn't been given an app
+     *     context yet; the query can't run in that state.
+     *
+     * Returns a packed long: bit 0 = batteryOptimized, bit 1 = hasContext.
+     * Simpler than a full JNI object return; Zig decodes into the map.
+     */
+    @JvmStatic
+    fun platformSignal(): Long {
+        val ctx = appContext ?: return 0L  // hasContext=false, everything else 0
+        val pm = ctx.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            ?: return 0b10L  // hasContext=true, batteryOptimized=false (unknown)
+        val optimized = if (android.os.Build.VERSION.SDK_INT >= 23) {
+            !pm.isIgnoringBatteryOptimizations(ctx.packageName)
+        } else {
+            false
+        }
+        var bits = 0b10L  // hasContext
+        if (optimized) bits = bits or 0b01L
+        return bits
+    }
+
     /** Called by MobWakeWorker to hand control to BEAM and await result. */
     suspend fun awaitBeamDispatch(identifier: String): ListenableWorker.Result {
         val deferred = CompletableDeferred<ListenableWorker.Result>()

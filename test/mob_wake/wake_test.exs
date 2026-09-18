@@ -162,6 +162,30 @@ defmodule Mob.WakeTest do
       # FunctionClauseError leaking to the caller.
       assert {:error, :not_yet_implemented} = Mob.Wake.schedule(id)
     end
+
+    test "raises ArgumentError on malformed :earliest opt" do
+      id = unique_tag(:sch_bad_earliest)
+      :ok = Mob.Wake.register(id, :refresh, {TestHandlers, :echo_ok})
+      # Flatten_opts is the shape guard. String is not a DateTime or
+      # non_neg_integer — MUST raise before the NIF is called so a
+      # typo doesn't silently no-op.
+      assert_raise ArgumentError, ~r/:earliest/, fn ->
+        Mob.Wake.schedule(id, earliest: "not-a-datetime")
+      end
+    end
+
+    test "accepts :earliest as DateTime and non_neg_integer" do
+      id = unique_tag(:sch_earliest_ok)
+      :ok = Mob.Wake.register(id, :refresh, {TestHandlers, :echo_ok})
+      # NIF not loaded so both return :not_yet_implemented, but the
+      # important thing is neither shape raises — flatten_opts accepts
+      # both forms.
+      assert {:error, :not_yet_implemented} =
+               Mob.Wake.schedule(id, earliest: DateTime.utc_now())
+
+      assert {:error, :not_yet_implemented} =
+               Mob.Wake.schedule(id, earliest: 60_000)
+    end
   end
 
   # ── status/1 ────────────────────────────────────────────────────────
@@ -175,6 +199,9 @@ defmodule Mob.WakeTest do
       assert s.state == :idle
       assert s.last_fired_at == nil
       assert s.next_eligible_fire == nil
+      # On host the NIF is absent so platform_signal collapses to %{}.
+      # Real devices override with iOS backgroundRefreshStatus or
+      # Android battery_optimized (see MOB-267).
       assert s.platform_signal == %{}
     end
 

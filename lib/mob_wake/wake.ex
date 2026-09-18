@@ -210,9 +210,24 @@ defmodule Mob.Wake do
   @spec status(MobWake.identifier_t()) :: map() | {:error, :unknown_identifier}
   def status(identifier) when is_atom(identifier) do
     case WakeRegistry.lookup(identifier) do
-      {:ok, {^identifier, _trigger, _mfa, state}} -> state
-      :error -> {:error, :unknown_identifier}
+      {:ok, {^identifier, _trigger, _mfa, state}} ->
+        Map.put(state, :platform_signal, platform_signal())
+
+      :error ->
+        {:error, :unknown_identifier}
     end
+  end
+
+  # Fetches the per-platform reliability signal via the NIF.
+  # On host / iOS-below-13 / non-mob-Android builds the NIF is absent
+  # and we return %{}. Callers should treat an empty map as "we can't
+  # tell right now" — same shape as the platform_signal starting
+  # value.
+  defp platform_signal do
+    :mob_wake_nif.platform_signal()
+  catch
+    :error, :undef -> %{}
+    :error, :nif_not_loaded -> %{}
   end
 
   @doc """
@@ -272,18 +287,57 @@ defmodule Mob.Wake do
   defp invoke({m, f, extra_args}, payload), do: apply(m, f, extra_args ++ [payload])
 
   # Native scheduler entry points. iOS NIF landed in MOB-261; Android
-  # NIF lands in MOB-263. Until Android is up, the catch reports
-  # :not_yet_implemented on that platform so callers see a clear signal
-  # rather than a generic FunctionClauseError.
+  # NIF landed in MOB-263. Elixir side flattens opts to explicit args
+  # before crossing the boundary — the NIF stays a dumb dispatcher, all
+  # the keyword-shape logic lives in one place.
   #
-  # The NIF expects the identifier as a binary — atoms don't cross the
-  # native boundary as nicely (enif_get_atom with a small buffer is a
-  # foot-gun for identifiers of arbitrary length). Convert once at the
-  # seam.
+  # Signature:
+  #   schedule(identifier :: binary, trigger :: atom,
+  #            earliest_ms :: non_neg_integer,
+  #            requires_charging :: boolean, requires_unmetered :: boolean)
+  #     :: :ok | {:error, reason}
+  #
+  # `:earliest` — DateTime OR non_neg_integer ms-from-now. DateTime in
+  #   the past becomes 0 (submit ASAP). Non-int / non-DT raises.
+  # `:constraints` — keyword: `charging: bool`, `unmetered: bool`.
+  #   Honored on `:processing` only (BGProcessingTaskRequest / WorkManager
+  #   Constraints.Builder). Silently ignored on `:refresh`.
   defp do_schedule(identifier, trigger, opts) do
-    :mob_wake_nif.schedule(Atom.to_string(identifier), trigger, opts)
+    {earliest_ms, requires_charging, requires_unmetered} = flatten_opts(opts)
+
+    :mob_wake_nif.schedule(
+      Atom.to_string(identifier),
+      trigger,
+      earliest_ms,
+      requires_charging,
+      requires_unmetered
+    )
   catch
     :error, :undef -> {:error, :not_yet_implemented}
     :error, :nif_not_loaded -> {:error, :not_yet_implemented}
+  end
+
+  defp flatten_opts(opts) do
+    earliest_ms =
+      case Keyword.get(opts, :earliest) do
+        nil ->
+          0
+
+        %DateTime{} = dt ->
+          dt |> DateTime.diff(DateTime.utc_now(), :millisecond) |> max(0)
+
+        ms when is_integer(ms) and ms >= 0 ->
+          ms
+
+        other ->
+          raise ArgumentError,
+                "mob_wake schedule/2 :earliest must be a DateTime or non-negative integer ms; got #{inspect(other)}"
+      end
+
+    constraints = Keyword.get(opts, :constraints, [])
+    requires_charging = Keyword.get(constraints, :charging, false)
+    requires_unmetered = Keyword.get(constraints, :unmetered, false)
+
+    {earliest_ms, requires_charging, requires_unmetered}
   end
 end

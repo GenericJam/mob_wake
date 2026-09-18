@@ -36,6 +36,7 @@ const WakeMethods = struct {
     schedule_work: jni.JMethodID = null,
     complete_work: jni.JMethodID = null,
     retry_work: jni.JMethodID = null,
+    platform_signal: jni.JMethodID = null,
 };
 
 var g_wake: WakeMethods = .{};
@@ -70,6 +71,7 @@ export fn Java_io_mob_wake_MobWakeBridge_nativeRegister(jenv: *jni.JNIEnv, cls: 
     g_wake.schedule_work = jni.getStaticMethodID(jenv, cls, "scheduleWork", "(Ljava/lang/String;Ljava/lang/String;JZZ)Z");
     g_wake.complete_work = jni.getStaticMethodID(jenv, cls, "completeWork", "(Ljava/lang/String;Z)V");
     g_wake.retry_work = jni.getStaticMethodID(jenv, cls, "retryWork", "(Ljava/lang/String;)V");
+    g_wake.platform_signal = jni.getStaticMethodID(jenv, cls, "platformSignal", "()J");
 }
 
 // ── Send helpers ─────────────────────────────────────────────────────────
@@ -273,11 +275,20 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
 
     var trigger_atom: [16]u8 = @splat(0);
     if (erts.enif_get_atom(env, argv[1], &trigger_atom, trigger_atom.len, erts.ERL_NIF_LATIN1) == 0) return erts.badarg(env);
-    // opts (argv[2]) parsing is a TODO; the Java side currently defaults
-    // earliestDelayMs=0, requiresCharging=false, requiresUnmetered=false.
-    // MOB-267 wires the keyword-list parse; for MOB-263 the defaults are
-    // exercised (immediate submission, no constraints).
-    _ = argv[2];
+
+    // Elixir side flattens opts to explicit args — earliest_ms, charging,
+    // unmetered. See Mob.Wake.flatten_opts/1.
+    var earliest_ms: c_long = 0;
+    if (erts.enif_get_long(env, argv[2], &earliest_ms) == 0) return erts.badarg(env);
+    if (earliest_ms < 0) return erts.badarg(env);
+
+    var charging_atom: [8]u8 = @splat(0);
+    if (erts.enif_get_atom(env, argv[3], &charging_atom, charging_atom.len, erts.ERL_NIF_LATIN1) == 0) return erts.badarg(env);
+    const charging: jni.JBoolean = if (std.mem.startsWith(u8, &charging_atom, "true")) 1 else 0;
+
+    var unmetered_atom: [8]u8 = @splat(0);
+    if (erts.enif_get_atom(env, argv[4], &unmetered_atom, unmetered_atom.len, erts.ERL_NIF_LATIN1) == 0) return erts.badarg(env);
+    const unmetered: jni.JBoolean = if (std.mem.startsWith(u8, &unmetered_atom, "true")) 1 else 0;
 
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse {
@@ -299,7 +310,7 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
     defer jni.deleteLocalRef(jenv, id_str);
     defer jni.deleteLocalRef(jenv, trg_str);
 
-    const ok = jenv.*.CallStaticBooleanMethod.?(jenv, g_wake_cls, g_wake.schedule_work, id_str, trg_str, @as(jni.JLong, 0), @as(jni.JBoolean, 0), @as(jni.JBoolean, 0));
+    const ok = jenv.*.CallStaticBooleanMethod.?(jenv, g_wake_cls, g_wake.schedule_work, id_str, trg_str, @as(jni.JLong, earliest_ms), charging, unmetered);
     detachIfAttached(attached);
     if (ok == 0) {
         return erts.tuple2(env, erts.atom(env, "error"), erts.atom(env, "submit_failed"));
@@ -338,12 +349,46 @@ fn nif_complete_push_noop(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const ert
     return erts.ok(env);
 }
 
+// platform_signal/0 → %{battery_optimized: bool, has_context: bool}
+// Wraps MobWakeBridge.platformSignal() which returns a bit-packed long:
+// bit 0 = batteryOptimized, bit 1 = hasContext. `has_context` distinguishes
+// "app is whitelisted" from "we can't tell yet" (bridge boot race).
+fn nif_platform_signal(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
+    _ = argc;
+    _ = argv;
+    var attached: c_int = 0;
+    const jenv = get_jenv(&attached) orelse return erts.enif_make_new_map(env);
+    if (g_wake_cls == null or g_wake.platform_signal == null) {
+        detachIfAttached(attached);
+        return erts.enif_make_new_map(env);
+    }
+    const bits = jenv.*.CallStaticLongMethod.?(jenv, g_wake_cls, g_wake.platform_signal);
+    detachIfAttached(attached);
+
+    const battery_optimized: bool = (bits & 0b01) != 0;
+    const has_context: bool = (bits & 0b10) != 0;
+
+    var map = erts.enif_make_new_map(env);
+    var out: erts.ERL_NIF_TERM = undefined;
+    _ = erts.enif_make_map_put(env, map,
+        erts.atom(env, "battery_optimized"),
+        erts.atom(env, if (battery_optimized) "true" else "false"),
+        &out);
+    map = out;
+    _ = erts.enif_make_map_put(env, map,
+        erts.atom(env, "has_context"),
+        erts.atom(env, if (has_context) "true" else "false"),
+        &out);
+    return out;
+}
+
 const nif_funcs = [_]erts.ErlNifFunc{
     .{ .name = "set_dispatcher_pid", .arity = 1, .fptr = nif_set_dispatcher_pid, .flags = 0 },
     .{ .name = "take_pending_wakes", .arity = 0, .fptr = nif_take_pending_wakes, .flags = 0 },
     .{ .name = "complete_task", .arity = 2, .fptr = nif_complete_task, .flags = 0 },
     .{ .name = "complete_push", .arity = 2, .fptr = nif_complete_push_noop, .flags = 0 },
-    .{ .name = "schedule", .arity = 3, .fptr = nif_schedule, .flags = 0 },
+    .{ .name = "platform_signal", .arity = 0, .fptr = nif_platform_signal, .flags = 0 },
+    .{ .name = "schedule", .arity = 5, .fptr = nif_schedule, .flags = 0 },
 };
 
 var nif_entry: erts.ErlNifEntry = .{

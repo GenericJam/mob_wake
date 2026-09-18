@@ -396,22 +396,61 @@ static ERL_NIF_TERM nif_complete_push(ErlNifEnv *env, int argc,
   return enif_make_atom(env, "ok");
 }
 
+// ── NIF: platform_signal ─────────────────────────────────────────────
+
+// platform_signal/0 → %{background_refresh_status: :available | :denied
+//                                                  | :restricted}
+// Called by Mob.Wake.status/1 to enrich the per-identifier state map
+// with iOS-specific reliability signals. Wraps
+// UIApplication.backgroundRefreshStatus — a system-wide setting the
+// user controls in Settings → General → Background App Refresh.
+// Values map directly:
+//   .available   → :available
+//   .denied      → :denied      (user turned it off)
+//   .restricted  → :restricted  (parental controls / MDM)
+static ERL_NIF_TERM nif_platform_signal(ErlNifEnv *env, int argc,
+                                         const ERL_NIF_TERM argv[]) {
+  (void)argc; (void)argv;
+  __block const char *status_atom = "available";
+  // Query on the main thread synchronously — UIApplication API access
+  // is main-thread-only.
+  if ([NSThread isMainThread]) {
+    UIBackgroundRefreshStatus s = [UIApplication sharedApplication].backgroundRefreshStatus;
+    if (s == UIBackgroundRefreshStatusDenied) status_atom = "denied";
+    else if (s == UIBackgroundRefreshStatusRestricted) status_atom = "restricted";
+  } else {
+    dispatch_sync(dispatch_get_main_queue(), ^{
+      UIBackgroundRefreshStatus s = [UIApplication sharedApplication].backgroundRefreshStatus;
+      if (s == UIBackgroundRefreshStatusDenied) status_atom = "denied";
+      else if (s == UIBackgroundRefreshStatusRestricted) status_atom = "restricted";
+    });
+  }
+
+  ERL_NIF_TERM map = enif_make_new_map(env);
+  ERL_NIF_TERM out;
+  enif_make_map_put(env, map,
+                    enif_make_atom(env, "background_refresh_status"),
+                    enif_make_atom(env, status_atom),
+                    &out);
+  return out;
+}
+
 // ── NIF: schedule ────────────────────────────────────────────────────
 
 static ERL_NIF_TERM nif_schedule(ErlNifEnv *env, int argc,
                                   const ERL_NIF_TERM argv[]) {
-  // schedule(identifier :: binary, trigger :: atom, opts :: keyword) →
-  //   :ok | {:error, reason}
+  // schedule(identifier :: binary,
+  //          trigger :: atom,
+  //          earliest_ms :: non_neg_integer,
+  //          requires_charging :: bool,
+  //          requires_unmetered :: bool)
+  //   → :ok | {:error, reason}
   //
-  // opts (keyword list) currently understood keys:
-  //   :earliest — POSIX seconds since epoch (integer); maps to
-  //     BGTaskRequest.earliestBeginDate.
-  //
-  // Constraints (:charging / :unmetered) are wired only on
-  // BGProcessingTaskRequest — BGAppRefreshTaskRequest doesn't accept
-  // them. We ignore constraint opts on :refresh rather than erroring
-  // so a task table shared with Android (where the same constraint
-  // shape is honored on WorkManager) doesn't need per-platform opts.
+  // Elixir side has flattened the opts keyword list into explicit
+  // args (see Mob.Wake.flatten_opts/1) — the NIF stays a dumb
+  // dispatcher. Constraints are wired only on BGProcessingTaskRequest;
+  // BGAppRefreshTaskRequest doesn't accept them and they're silently
+  // ignored (matches WorkManager's Android side).
   ErlNifBinary id_bin;
   if (!enif_inspect_binary(env, argv[0], &id_bin) &&
       !enif_inspect_iolist_as_binary(env, argv[0], &id_bin)) {
@@ -421,10 +460,27 @@ static ERL_NIF_TERM nif_schedule(ErlNifEnv *env, int argc,
   if (!enif_get_atom(env, argv[1], trigger, sizeof(trigger), ERL_NIF_LATIN1)) {
     return enif_make_badarg(env);
   }
+  long earliest_ms = 0;
+  if (!enif_get_long(env, argv[2], &earliest_ms) || earliest_ms < 0) {
+    return enif_make_badarg(env);
+  }
+  int charging = 0, unmetered = 0;
+  {
+    char buf[8] = {0};
+    if (!enif_get_atom(env, argv[3], buf, sizeof(buf), ERL_NIF_LATIN1)) {
+      return enif_make_badarg(env);
+    }
+    charging = (strncmp(buf, "true", 5) == 0);
+  }
+  {
+    char buf[8] = {0};
+    if (!enif_get_atom(env, argv[4], buf, sizeof(buf), ERL_NIF_LATIN1)) {
+      return enif_make_badarg(env);
+    }
+    unmetered = (strncmp(buf, "true", 5) == 0);
+  }
+
   if (strncmp(trigger, "push", 5) == 0) {
-    // Sanity — Elixir's Mob.Wake.schedule/2 rejects :push before we
-    // get here, but a caller invoking the NIF directly should still be
-    // told no.
     return enif_make_tuple2(env,
                             enif_make_atom(env, "error"),
                             enif_make_atom(env, "cannot_schedule_push"));
@@ -442,11 +498,15 @@ static ERL_NIF_TERM nif_schedule(ErlNifEnv *env, int argc,
     } else if (strncmp(trigger, "processing", 11) == 0) {
       BGProcessingTaskRequest *p =
           [[BGProcessingTaskRequest alloc] initWithIdentifier:identifier];
-      // Defaults matched to the common case ("housekeeping when the
-      // device is plugged in and idle") — mob_wake's docs recommend
-      // :refresh for anything that runs while the user is active.
-      p.requiresExternalPower = YES;
-      p.requiresNetworkConnectivity = NO;
+      // Constraint mapping:
+      //   :charging  → requiresExternalPower
+      //   :unmetered → requiresNetworkConnectivity (best iOS analogue —
+      //                iOS doesn't distinguish metered vs unmetered at
+      //                the API level, so a caller wanting "wifi only"
+      //                asks for network + hopes cellular-only users
+      //                are on Wi-Fi at the moment).
+      p.requiresExternalPower = charging ? YES : NO;
+      p.requiresNetworkConnectivity = unmetered ? YES : NO;
       req = p;
     } else {
       return enif_make_tuple2(env,
@@ -454,8 +514,10 @@ static ERL_NIF_TERM nif_schedule(ErlNifEnv *env, int argc,
                               enif_make_atom(env, "unknown_trigger"));
     }
 
-    // TODO(MOB-267): parse opts keyword list for :earliest and constraints.
-    (void)argv[2];
+    if (earliest_ms > 0) {
+      req.earliestBeginDate =
+          [NSDate dateWithTimeIntervalSinceNow:((double)earliest_ms) / 1000.0];
+    }
 
     NSError *err = nil;
     BOOL ok = [[BGTaskScheduler sharedScheduler] submitTaskRequest:req error:&err];
@@ -495,7 +557,8 @@ static ErlNifFunc nif_funcs[] = {
     {"take_pending_wakes",  0, nif_take_pending_wakes,  0},
     {"complete_task",       2, nif_complete_task,       0},
     {"complete_push",       2, nif_complete_push,       0},
-    {"schedule",            3, nif_schedule,            0},
+    {"platform_signal",     0, nif_platform_signal,     0},
+    {"schedule",            5, nif_schedule,            0},
 };
 
 ERL_NIF_INIT(mob_wake_nif, nif_funcs, on_load, NULL, NULL, on_unload)

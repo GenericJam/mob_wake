@@ -8,6 +8,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+### Added — MOB-267 status/1 enrichment + schedule opts parse
+- `Mob.Wake.flatten_opts/1` — parses `schedule/2`'s keyword list into an explicit `{earliest_ms, requires_charging, requires_unmetered}` tuple before crossing the NIF boundary. Elixir owns the shape; the NIFs stay dumb dispatchers.
+- `:earliest` accepts a `DateTime` (converted to ms-from-now, past times clamped to 0) or a non-negative integer ms. Anything else raises `ArgumentError` at the flatten step so a typo (e.g. `earliest: "5m"`) doesn't silently no-op.
+- `:constraints` keyword: `:charging` / `:unmetered` bool flags. Honored on `:processing` (BGProcessingTaskRequest.requiresExternalPower / requiresNetworkConnectivity; WorkManager Constraints.Builder). Ignored on `:refresh` — both platforms.
+- `schedule/5` NIF (was `schedule/3`) on both iOS and Android: identifier, trigger, earliest_ms, charging_bool_atom, unmetered_bool_atom.
+- `platform_signal/0` NIF on both platforms; called by `Mob.Wake.status/1` and merged into the returned map's `:platform_signal`.
+  - iOS: `%{background_refresh_status: :available | :denied | :restricted}` — wraps `UIApplication.backgroundRefreshStatus` (main-thread-only, so `dispatch_sync` when called off-main).
+  - Android: `%{battery_optimized: bool, has_context: bool}` — wraps `PowerManager.isIgnoringBatteryOptimizations(packageName)`. Bit-packed long return from Kotlin (bit 0 = optimized, bit 1 = hasContext) keeps the JNI boundary simple. `has_context: false` means the bridge hasn't been given an app context yet — signal to the caller that "we can't tell" is distinct from "battery optimization is off".
+- 2 new tests pin the flatten_opts contract: DateTime + non_neg_integer accepted, malformed `:earliest` raises with a clear message.
+
 ### Added — MOB-264 Android FCM data-message receive
 - `priv/native/android/MobWakeFcmService.kt` — `FirebaseMessagingService` subclass. `onMessageReceived` extracts `data["mob_wake_id"]` as the identifier and forwards the whole data map (JSON-serialised) to the bridge. `onNewToken` forwards the FCM registration token.
 - `MobWakeBridge` gains `onPushFired(identifier, payloadJson)` (Kotlin, called by the service) which invokes the new `nativeDeliverPush(id, push_id, payloadJson)` JNI thunk on the Zig NIF. `push_id` is a Kotlin-generated UUID — matches the iOS shape where multiple in-flight pushes per identifier are supported.
