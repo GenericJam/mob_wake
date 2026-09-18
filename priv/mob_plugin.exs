@@ -12,11 +12,15 @@
   nifs: [
     # iOS: BGTaskScheduler + silent APNs receive (MOB-261 + MOB-262).
     # Compiled as ObjC (-fobjc-arc) via the plugin objc-NIF path.
-    # Absent on non-iOS builds (platform: :ios). Android's WorkManager +
-    # FCM NIF (MOB-263/264) will land as a separate zig NIF here.
-    %{module: :mob_wake_nif, native_dir: "priv/native/ios", lang: :objc, platform: :ios}
+    %{module: :mob_wake_nif, native_dir: "priv/native/ios", lang: :objc, platform: :ios},
+    # Android: WorkManager (MOB-263) + FCM (MOB-264). Zig NIF bridging to
+    # the Kotlin io.mob.wake.MobWakeBridge which owns the CoroutineWorker
+    # + FCM handlers. Structurally mirrors mob_sms's Android NIF.
+    %{module: :mob_wake_nif, native_dir: "priv/native/jni", lang: :zig, platform: :android}
   ],
   android: %{
+    bridge_kt: "priv/native/android/MobWakeBridge.kt",
+    bridge_class: "io.mob.wake.MobWakeBridge",
     permissions: [
       # Post-only permission for a notification the app might raise from
       # inside a background handler (`Mob.Notify.local/1`). Not required
@@ -25,7 +29,12 @@
       # surfaces it once, not per-app.
       "android.permission.POST_NOTIFICATIONS"
     ],
-    gradle_deps: []
+    gradle_deps: [
+      # WorkManager runtime + coroutines integration. 2.9.0 is the last
+      # stable that compiles cleanly against Kotlin 1.9 (mob's current
+      # Android baseline). Bump when mob moves to Kotlin 2.x.
+      "androidx.work:work-runtime-ktx:2.9.0"
+    ]
   },
   ios: %{
     frameworks: ["BackgroundTasks", "UserNotifications"],

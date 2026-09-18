@@ -88,6 +88,22 @@ defmodule Mob.WakeTest do
       assert {:error, :nope} = Mob.Wake.dispatch(id)
     end
 
+    test "propagates a handler's {:ok, :no_data} (push :no_data convention)" do
+      # Push handlers can signal "ran but no new data" via {:ok, :no_data}.
+      # Verifies the return survives run_handler_with_timeout's match on
+      # the {:ok, {:ok, :no_data}} → {:ok, :no_data} branch. The Registry's
+      # push_result_atom then maps it to :no_data for
+      # UIBackgroundFetchResult on iOS.
+      id = unique_tag(:dis_no_data)
+
+      defmodule NoDataHandler do
+        def run(_payload), do: {:ok, :no_data}
+      end
+
+      :ok = Mob.Wake.register(id, :push, {NoDataHandler, :run})
+      assert {:ok, :no_data} = Mob.Wake.dispatch(id)
+    end
+
     test "wraps a handler crash in {:error, {:crashed, _}}" do
       id = unique_tag(:dis_crash)
       :ok = Mob.Wake.register(id, :refresh, {TestHandlers, :crash})

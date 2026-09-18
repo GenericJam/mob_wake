@@ -156,7 +156,12 @@ defmodule Mob.Wake do
 
   ## Return
 
-  * `:ok` — handler returned `:ok`.
+  * `:ok` — handler returned `:ok`. Silent-APNs completions map this to
+    `UIBackgroundFetchResultNewData`; scheduler firings map to
+    `setTaskCompleted(success: true)`.
+  * `{:ok, :no_data}` — push-only convention: handler ran successfully
+    but no new data resulted. Maps to `UIBackgroundFetchResultNoData`.
+    Passed through from scheduler triggers as-is (they don't use it).
   * `{:error, :unknown_identifier}` — no MFA registered.
   * `{:error, :timeout}` — handler ran past the trigger's Elixir timeout.
   * `{:error, {:crashed, error}}` — handler raised.
@@ -164,7 +169,7 @@ defmodule Mob.Wake do
     returned; `:retry` is honored on Android as `Result.retry()`.
   """
   @spec dispatch(MobWake.identifier_t() | %{identifier: MobWake.identifier_t(), payload: map()}) ::
-          :ok | {:error, term()}
+          :ok | {:ok, :no_data} | {:error, term()}
   def dispatch(input) do
     {identifier, payload} = unpack_input(input)
 
@@ -255,6 +260,7 @@ defmodule Mob.Wake do
 
     case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
       {:ok, :ok} -> :ok
+      {:ok, {:ok, :no_data}} -> {:ok, :no_data}
       {:ok, {:error, reason}} -> {:error, reason}
       {:ok, other} -> {:error, {:unexpected_return, other}}
       {:exit, reason} -> {:error, {:crashed, reason}}

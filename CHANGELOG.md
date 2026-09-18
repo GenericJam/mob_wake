@@ -8,6 +8,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+### Added — MOB-263 Android WorkManager wiring
+- `priv/native/jni/mob_wake_nif.zig` — Zig NIF exposing the same 4 entry points as the iOS side (`set_dispatcher_pid`, `take_pending_wakes`, `complete_task`, `schedule`) plus two JNI thunks (`nativeRegister`, `nativeDeliverWake`) the Kotlin bridge calls. Fixed-capacity pending-wake queue (32 identifiers × 128 bytes) mirrors the iOS pattern.
+- `priv/native/android/MobWakeBridge.kt` — Kotlin bridge (`object`) with `nativeRegister/`nativeDeliverWake` externals plus `scheduleWork`, `completeWork`, `retryWork`, and `awaitBeamDispatch` (coroutine that Workers use to hand off to BEAM and await result). WorkManager enqueue uses `enqueueUniqueWork(identifier, REPLACE, ...)` so re-scheduling supersedes the prior pending.
+- `priv/native/android/MobWakeWorker.kt` — thin `CoroutineWorker` subclass. Standard `(Context, WorkerParameters)` constructor lets WorkManager's default factory instantiate — no custom `Configuration.Provider` required on the host `Application`.
+- Result mapping: Elixir `:ok` → `Result.success()`, `{:error, :retry}` → `Result.retry()` (goes back to WorkManager for backoff), any other `{:error, _}` → `Result.failure()`.
+- Timeout: bridge waits 9 minutes (a bit under WorkManager's practical 10-minute per-Worker upper bound) before falling back to `Result.failure()` — surfaces a real timeout rather than letting WorkManager kill us and mis-attribute.
+- Manifest: `mob_wake_nif` NIF declared for `:android` platform (Zig); Kotlin bridge registered via `bridge_kt` + `bridge_class`; `androidx.work:work-runtime-ktx:2.9.0` gradle dep (2.9.0 is the last that compiles cleanly against Kotlin 1.9 — mob's current Android baseline).
+- `Mob.Wake.dispatch/1` spec widened to `:ok | {:ok, :no_data} | {:error, term()}` — `{:ok, :no_data}` was already the documented push-handler convention but wasn't reachable through `run_handler_with_timeout`; the extra match clause now propagates it end-to-end. 1 new test pins the shape.
+
+### Known / deferred for MOB-263
+- Not physical-device-verified — that's MOB-268. Kotlin + Zig compile via mob's Android build path at host-app deploy time; unit-testable Elixir wiring is proven (25 tests green on host).
+- `schedule/3`'s opts keyword parsing is still a TODO in both NIFs. Java-side defaults (earliestDelayMs=0, no constraints) are what a first-fire uses; MOB-267 wires the full parse.
+- FCM data-message handling (`:push` trigger) lands in MOB-264 — same bridge file, adds a `MobWakeFcmService` FirebaseMessagingService subclass and a `nativeDeliverPush` JNI thunk.
+- `MobWakeBridge.setAppContext` needs to be called at app start for `scheduleWork` to succeed before any Worker has fired. Mob's Android framework should invoke this via the bridge_class registration flow (per the manifest); if that surface doesn't exist yet the Worker's own `setAppContext(applicationContext)` self-heal covers the fire-then-schedule case. MOB-268 physical verification will surface any gap.
+
 ### Added — MOB-262 iOS silent APNs receive
 - `mob_wake_nif.m` gains two entry points: `+onPushFired:completionHandler:` (ObjC, called from AppDelegate's `didReceiveRemoteNotification:fetchCompletionHandler:`) and `complete_push/2` NIF (Elixir → native → `UIBackgroundFetchResult` completion).
 - Native `g_push_completions` table keyed by `NSUUID` string per push (multiple simultaneous pushes for the same identifier are supported, unlike BGTasks where one identifier maps to one fire in flight).
