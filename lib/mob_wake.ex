@@ -134,4 +134,55 @@ defmodule MobWake do
 
   @typedoc "A registered task: identifier plus the MFA the plugin invokes when the OS fires."
   @type task_entry :: {identifier_t, module(), atom(), trigger()}
+
+  @doc """
+  Build a `mob_push`-shaped payload that will fire `mob_wake` on the
+  receiving device.
+
+  The convention (see `decisions/2026-09-18-identifier-and-payload-schema.md`):
+
+  * iOS: `content_available: true` + top-level `mob_wake_id` in the data
+    map. Silent APNs on the device routes on `userInfo["mob_wake_id"]`.
+  * Android: FCM data-only message with `mob_wake_id` in the data map.
+    Same key — the `mob_push` library sends the identical shape to both
+    sides.
+
+  ## Example
+
+      # Server-side (Elixir; wherever you fan out pushes)
+      payload = MobWake.wake_payload(:sync_notes,
+                                     data: %{"peer" => "abc"})
+
+      MobPush.send(ios_token, :ios, payload)
+      MobPush.send(android_token, :android, payload)
+
+  Handlers on the device receive `{:change, :sync_notes, payload_json}`
+  as usual — the payload arrives as a JSON binary; decode with Jason /
+  `:json` if you want a map.
+
+  ## Options
+
+    * `:data` — a map of additional top-level keys merged into the
+      payload. `mob_wake_id` is always set to the identifier and
+      overrides any conflicting key.
+    * `:title`, `:body` — visible on iOS (APNs requires them at the
+      `alert` layer; `mob_push` currently sends both regardless).
+      Defaulted to a single space each so a truly-silent push doesn't
+      surface visible copy. Override to send a hybrid visible+silent
+      push.
+  """
+  @spec wake_payload(identifier_t, keyword()) :: map()
+  def wake_payload(identifier, opts \\ []) when is_atom(identifier) do
+    data =
+      opts
+      |> Keyword.get(:data, %{})
+      |> Map.put("mob_wake_id", Atom.to_string(identifier))
+
+    %{
+      title: Keyword.get(opts, :title, " "),
+      body: Keyword.get(opts, :body, " "),
+      content_available: true,
+      data: data
+    }
+  end
 end

@@ -8,6 +8,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+### Added — MOB-269 identifier + payload schema (mob_push coordination)
+- `MobWake.wake_payload/2` — canonical builder for a `mob_push`-shaped payload. Returns `%{title: " ", body: " ", content_available: true, data: %{"mob_wake_id" => ...}}`. Same shape works for both `MobPush.send(token, :ios, payload)` and `MobPush.send(token, :android, payload)` — one payload, two send calls, no per-platform forking.
+- ADR: `decisions/2026-09-18-identifier-and-payload-schema.md` — anchors the `mob_wake_id` key convention. Any change here breaks receiver routing on both platforms; the ADR names the three sites that must be updated in lockstep (this file, iOS `MobWakeDispatcher.onPushFired:`, Android `MobWakeFcmService.onMessageReceived`).
+- 5 new tests pin the wake_payload contract: identifier stringified, `content_available: true`, caller `:data` merged, `mob_wake_id` overrides caller's (deliberate — key is ours), title+body defaulted to a single space to satisfy `mob_push` 0.2's required-fields pattern-match.
+- README: `mob_push` link updated (now on Hex, not "in progress"), example added.
+
+### Not in MOB-269 scope
+- **Payload signing.** MOB-269's Linear title mentions signing; this ADR punts on it. Current threat model is "trust OS + trust APNs/FCM channel" — same as every silent-push app. Signed payloads that let the receiver verify the sender would need a shared key between the app's server and the device; a follow-up issue.
+- **`mob_push` cross-reference is one-way.** `mob_push` doesn't need to know about `mob_wake` — its existing `send/3` API accepts the shape as-is. If a `MobPush.wake/3` convenience wrapper turns out worth it, that's a mob_push-side change.
+
 ### Added — MOB-267 status/1 enrichment + schedule opts parse
 - `Mob.Wake.flatten_opts/1` — parses `schedule/2`'s keyword list into an explicit `{earliest_ms, requires_charging, requires_unmetered}` tuple before crossing the NIF boundary. Elixir owns the shape; the NIFs stay dumb dispatchers.
 - `:earliest` accepts a `DateTime` (converted to ms-from-now, past times clamped to 0) or a non-negative integer ms. Anything else raises `ArgumentError` at the flatten step so a typo (e.g. `earliest: "5m"`) doesn't silently no-op.

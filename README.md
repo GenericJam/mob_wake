@@ -150,7 +150,14 @@ Under the `Mob.Wake` namespace. Full contract in the module's @moduledoc.
 
 ## Related plugins
 
-* [`mob_push`](https://github.com/GenericJam/mob_push) (in progress) — the *send* side of silent APNs / FCM. When you want deterministic wake timing, `mob_push` sends the trigger and `mob_wake` receives it. Identifier schemes coordinate.
+* [`mob_push`](https://hexdocs.pm/mob_push) — the *send* side of silent APNs / FCM. When you want deterministic wake timing, `mob_push` sends the trigger and `mob_wake` receives it. Use `MobWake.wake_payload/2` to build the payload for `MobPush.send/3` — same shape on both platforms (see [the identifier-and-payload ADR](decisions/2026-09-18-identifier-and-payload-schema.md)).
+
+  ```elixir
+  # Server-side
+  payload = MobWake.wake_payload(:sync_notes, data: %{"peer" => "abc"})
+  MobPush.send(ios_token, :ios, payload)
+  MobPush.send(android_token, :android, payload)
+  ```
 * `mob_background` (already on Hex, 0.1.0) — the *keep-alive* pattern. Different concept, different lifecycle. Read its README if you're trying to decide which one you want.
 
 ## Cross-references
