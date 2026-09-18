@@ -68,6 +68,25 @@ object MobWakeBridge {
     @JvmStatic external fun nativeRegister()
     // NIF → JNI thunks the Zig side exports.
     @JvmStatic external fun nativeDeliverWake(identifier: String)
+    @JvmStatic external fun nativeDeliverPush(identifier: String, pushId: String, payloadJson: String)
+    @JvmStatic external fun nativeDeliverFcmToken(token: String)
+
+    /** MobWakeFcmService.onMessageReceived reaches here. Fire-and-forget. */
+    @JvmStatic
+    fun onPushFired(identifier: String, payloadJson: String) {
+        // Native side generates its own push_id (matches the iOS shape
+        // where multiple in-flight pushes for one identifier are
+        // supported). FCM has no completion callback so complete_push
+        // is a no-op on Android, but we keep the shape so the Elixir
+        // Registry can handle both platforms uniformly.
+        nativeDeliverPush(identifier, java.util.UUID.randomUUID().toString(), payloadJson)
+    }
+
+    /** MobWakeFcmService.onNewToken reaches here. */
+    @JvmStatic
+    fun onFcmTokenRefresh(token: String) {
+        nativeDeliverFcmToken(token)
+    }
 
     /** Called by MobWakeWorker to hand control to BEAM and await result. */
     suspend fun awaitBeamDispatch(identifier: String): ListenableWorker.Result {
@@ -157,4 +176,7 @@ object MobWakeBridge {
     }
 
     const val KEY_IDENTIFIER = "mob_wake_identifier"
+    // Server-side FCM data-message convention: the identifier lives under
+    // this data-map key. Mirrors iOS's userInfo["mob_wake_id"].
+    const val KEY_FCM_ID = "mob_wake_id"
 }

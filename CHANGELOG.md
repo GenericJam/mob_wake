@@ -8,6 +8,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+### Added — MOB-264 Android FCM data-message receive
+- `priv/native/android/MobWakeFcmService.kt` — `FirebaseMessagingService` subclass. `onMessageReceived` extracts `data["mob_wake_id"]` as the identifier and forwards the whole data map (JSON-serialised) to the bridge. `onNewToken` forwards the FCM registration token.
+- `MobWakeBridge` gains `onPushFired(identifier, payloadJson)` (Kotlin, called by the service) which invokes the new `nativeDeliverPush(id, push_id, payloadJson)` JNI thunk on the Zig NIF. `push_id` is a Kotlin-generated UUID — matches the iOS shape where multiple in-flight pushes per identifier are supported.
+- `MobWakeBridge` gains `onFcmTokenRefresh(token)` which invokes `nativeDeliverFcmToken(token)`.
+- Zig NIF gains `nativeDeliverPush` and `nativeDeliverFcmToken` JNI exports. Both send to the dispatcher pid or drop if not set (FCM has ~10s process budget on Android — matches the iOS silent-APNs "fail fast on cold start" choice).
+- Zig NIF gains a no-op `complete_push/2` so the Elixir Registry can call it uniformly on both platforms without a per-platform branch. FCM has no completion callback so the completion signal isn't observable to the server; kept in the shape for API cleanliness.
+- `Mob.Wake.Registry` gains `handle_info({:mob_wake_fcm_token, token}, _)` — currently logs at info; a per-pid subscription API for the token is a follow-up.
+- Manifest: `com.google.firebase:firebase-messaging:23.4.1` added to `gradle_deps`. Host app still needs `google-services.json` (that's app-specific config, not plugin-owned).
+- Server-side FCM data-message convention: `data.mob_wake_id` names the identifier (matches the iOS `userInfo.mob_wake_id` convention so `mob_push` can send the same shape across both platforms).
+
+### Known / deferred for MOB-264
+- FCM service registration in host `AndroidManifest.xml` is manual until MOB-265 codegen writes it. Snippet is in the `MobWakeFcmService.kt` @file header. Also requires `com.google.gms.google-services` gradle plugin applied at app level with `google-services.json` in `app/` — that's Firebase setup, out of mob_wake's scope.
+- FCM cold-start-via-push (BEAM asleep when push arrives) drops the push. Same trade-off as iOS silent APNs, same reason. A follow-up can add a native-side pending queue with a native timer if real workloads hit this.
+- Not physical-device-verified. MOB-268 covers physical iOS + Android verification contiguously.
+
 ### Added — MOB-263 Android WorkManager wiring
 - `priv/native/jni/mob_wake_nif.zig` — Zig NIF exposing the same 4 entry points as the iOS side (`set_dispatcher_pid`, `take_pending_wakes`, `complete_task`, `schedule`) plus two JNI thunks (`nativeRegister`, `nativeDeliverWake`) the Kotlin bridge calls. Fixed-capacity pending-wake queue (32 identifiers × 128 bytes) mirrors the iOS pattern.
 - `priv/native/android/MobWakeBridge.kt` — Kotlin bridge (`object`) with `nativeRegister/`nativeDeliverWake` externals plus `scheduleWork`, `completeWork`, `retryWork`, and `awaitBeamDispatch` (coroutine that Workers use to hand off to BEAM and await result). WorkManager enqueue uses `enqueueUniqueWork(identifier, REPLACE, ...)` so re-scheduling supersedes the prior pending.

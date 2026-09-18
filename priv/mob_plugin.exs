@@ -33,7 +33,12 @@
       # WorkManager runtime + coroutines integration. 2.9.0 is the last
       # stable that compiles cleanly against Kotlin 1.9 (mob's current
       # Android baseline). Bump when mob moves to Kotlin 2.x.
-      "androidx.work:work-runtime-ktx:2.9.0"
+      "androidx.work:work-runtime-ktx:2.9.0",
+      # FCM data-message receive (MOB-264). Same Kotlin-1.9 pin
+      # discipline. Host apps still need `google-services.json` in
+      # `app/` (registered with google-services gradle plugin);
+      # mob_wake declares only the runtime dependency.
+      "com.google.firebase:firebase-messaging:23.4.1"
     ]
   },
   ios: %{

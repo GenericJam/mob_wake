@@ -161,6 +161,17 @@ defmodule Mob.Wake.Registry do
     {:noreply, s}
   end
 
+  def handle_info({:mob_wake_fcm_token, token}, s) when is_binary(token) do
+    # Android FCM token registration / refresh. The app subscribes to
+    # this by adding its own `handle_info({:mob_wake_fcm_token, token},
+    # ...)` clause on a screen or process it wants notified — mob's
+    # dispatcher-pid is this GenServer, so any forwarding surface added
+    # in a follow-up (a per-pid subscription API) would route through
+    # here. For now, log at info-level so an operator can find it.
+    Logger.info("mob_wake: FCM token received (#{String.length(token)} chars)")
+    {:noreply, s}
+  end
+
   defp push_result_atom(:ok), do: :new_data
   defp push_result_atom({:ok, :no_data}), do: :no_data
   defp push_result_atom(_), do: :failed

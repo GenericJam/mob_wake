@@ -112,6 +112,88 @@ export fn Java_io_mob_wake_MobWakeBridge_nativeDeliverWake(jenv: *jni.JNIEnv, cl
     if (pid_valid) sendWakeFired(&pid_snap, id_c[0..id_len]);
 }
 
+// ── nativeDeliverPush — Kotlin's FCM service calls this ──────────────────
+// Sends {:push_fired, id :: binary, push_id :: binary, payload_json ::
+// binary} to the dispatcher pid. If the dispatcher pid isn't set yet
+// we drop — FCM has a ~10s process budget on Android and BEAM waking
+// from cold-suspend won't reliably make that window; failing fast
+// mirrors the iOS silent-APNs choice.
+export fn Java_io_mob_wake_MobWakeBridge_nativeDeliverPush(jenv: *jni.JNIEnv, cls: jni.JClass, id: jni.JString, push_id: jni.JString, payload: jni.JString) callconv(.c) void {
+    _ = cls;
+    const id_c = jenv.*.GetStringUTFChars.?(jenv, id, null) orelse return;
+    defer jenv.*.ReleaseStringUTFChars.?(jenv, id, id_c);
+    const push_id_c = jenv.*.GetStringUTFChars.?(jenv, push_id, null) orelse return;
+    defer jenv.*.ReleaseStringUTFChars.?(jenv, push_id, push_id_c);
+    const payload_c = jenv.*.GetStringUTFChars.?(jenv, payload, null) orelse return;
+    defer jenv.*.ReleaseStringUTFChars.?(jenv, payload, payload_c);
+
+    if (g_state_mutex == null) return;
+    erts.enif_mutex_lock(g_state_mutex);
+    const pid_valid = g_dispatcher_pid_set;
+    var pid_snap: erts.ErlNifPid = undefined;
+    if (pid_valid) pid_snap = g_dispatcher_pid;
+    erts.enif_mutex_unlock(g_state_mutex);
+
+    if (!pid_valid) return;
+
+    var id_len: usize = 0;
+    while (id_c[id_len] != 0) : (id_len += 1) {}
+    var push_id_len: usize = 0;
+    while (push_id_c[push_id_len] != 0) : (push_id_len += 1) {}
+    var payload_len: usize = 0;
+    while (payload_c[payload_len] != 0) : (payload_len += 1) {}
+
+    const env = erts.enif_alloc_env() orelse return;
+    defer erts.enif_free_env(env);
+    var id_bin: erts.ErlNifBinary = undefined;
+    var push_id_bin: erts.ErlNifBinary = undefined;
+    var payload_bin: erts.ErlNifBinary = undefined;
+    if (erts.enif_alloc_binary(id_len, &id_bin) == 0) return;
+    if (erts.enif_alloc_binary(push_id_len, &push_id_bin) == 0) return;
+    if (erts.enif_alloc_binary(payload_len, &payload_bin) == 0) return;
+    @memcpy(id_bin.data[0..id_len], id_c[0..id_len]);
+    @memcpy(push_id_bin.data[0..push_id_len], push_id_c[0..push_id_len]);
+    @memcpy(payload_bin.data[0..payload_len], payload_c[0..payload_len]);
+    const msg = erts.makeTuple(env, .{
+        erts.atom(env, "push_fired"),
+        erts.enif_make_binary(env, &id_bin),
+        erts.enif_make_binary(env, &push_id_bin),
+        erts.enif_make_binary(env, &payload_bin),
+    });
+    _ = erts.enif_send(null, &pid_snap, env, msg);
+}
+
+// ── nativeDeliverFcmToken — sent on token registration/refresh ───────────
+// Fires {:mob_wake_fcm_token, token :: binary} at the dispatcher pid
+// so the app can upload it to its push server.
+export fn Java_io_mob_wake_MobWakeBridge_nativeDeliverFcmToken(jenv: *jni.JNIEnv, cls: jni.JClass, token: jni.JString) callconv(.c) void {
+    _ = cls;
+    const tok_c = jenv.*.GetStringUTFChars.?(jenv, token, null) orelse return;
+    defer jenv.*.ReleaseStringUTFChars.?(jenv, token, tok_c);
+
+    if (g_state_mutex == null) return;
+    erts.enif_mutex_lock(g_state_mutex);
+    const pid_valid = g_dispatcher_pid_set;
+    var pid_snap: erts.ErlNifPid = undefined;
+    if (pid_valid) pid_snap = g_dispatcher_pid;
+    erts.enif_mutex_unlock(g_state_mutex);
+    if (!pid_valid) return;
+
+    var tok_len: usize = 0;
+    while (tok_c[tok_len] != 0) : (tok_len += 1) {}
+
+    const env = erts.enif_alloc_env() orelse return;
+    defer erts.enif_free_env(env);
+    var bin: erts.ErlNifBinary = undefined;
+    if (erts.enif_alloc_binary(tok_len, &bin) == 0) return;
+    @memcpy(bin.data[0..tok_len], tok_c[0..tok_len]);
+    const msg = erts.makeTuple(env, .{
+        erts.atom(env, "mob_wake_fcm_token"),
+        erts.enif_make_binary(env, &bin),
+    });
+    _ = erts.enif_send(null, &pid_snap, env, msg);
+}
+
 // ── NIFs ─────────────────────────────────────────────────────────────────
 
 fn nif_set_dispatcher_pid(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
@@ -245,10 +327,22 @@ fn nifLoad(env: ?*erts.ErlNifEnv, priv: *?*anyopaque, info: erts.ERL_NIF_TERM) c
     return if (g_state_mutex == null) 1 else 0;
 }
 
+// complete_push is iOS-only (silent APNs has a fetchCompletionHandler
+// callback; FCM does not). Kept exported here as a no-op so the Elixir
+// Registry's complete_push_native call succeeds on both platforms
+// without a per-platform branch — mirrors mob-core's "cross-platform
+// contract > per-platform gate" convention.
+fn nif_complete_push_noop(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
+    _ = argc;
+    _ = argv;
+    return erts.ok(env);
+}
+
 const nif_funcs = [_]erts.ErlNifFunc{
     .{ .name = "set_dispatcher_pid", .arity = 1, .fptr = nif_set_dispatcher_pid, .flags = 0 },
     .{ .name = "take_pending_wakes", .arity = 0, .fptr = nif_take_pending_wakes, .flags = 0 },
     .{ .name = "complete_task", .arity = 2, .fptr = nif_complete_task, .flags = 0 },
+    .{ .name = "complete_push", .arity = 2, .fptr = nif_complete_push_noop, .flags = 0 },
     .{ .name = "schedule", .arity = 3, .fptr = nif_schedule, .flags = 0 },
 };
 
