@@ -87,6 +87,46 @@ defmodule Mob.Wake.RegistryTest do
       assert %DateTime{} = s.last_fired_at
     end
 
+    test "accepts binary identifier from native NIF and routes to atom clause" do
+      # Native NIFs (ObjC nsstring_to_bin, Zig enif_make_binary) send the
+      # identifier as a BINARY, not an atom. Prior code guarded the
+      # atom clause only — the binary form crashed the Registry with
+      # FunctionClauseError, which took down the ETS table with it.
+      # MOB-268 physical device caught this: WorkManager fired the
+      # Worker → nativeDeliverWake → {:wake_fired, "verify_processing"}
+      # → Registry crash → ETS wiped → next Mob.Wake.schedule call
+      # returned :unknown_identifier for everything.
+      id = :"wake_bin_dispatch_#{System.unique_integer([:positive])}"
+      :ok = Mob.Wake.register(id, :refresh, {TestHandlers, :report_and_ok, [self()]})
+
+      send(Mob.Wake.Registry, {:wake_fired, Atom.to_string(id)})
+
+      # Handler ran with the same shape as the atom-form entry.
+      assert_receive {:report_and_ok, nil}, 500
+
+      # Registry still alive after a follow-up register — proves it
+      # didn't terminate on the binary form.
+      followup = :"wake_bin_alive_#{System.unique_integer([:positive])}"
+      assert :ok = Mob.Wake.register(followup, :refresh, {TestHandlers, :report_and_ok, [self()]})
+    end
+
+    test "drops an unregistered binary identifier without crashing (atom-table safety)" do
+      # Same security-critical path as the push_fired variant: an
+      # unregistered identifier arriving from the wild must not mint
+      # a new atom nor take down the Registry.
+      unknown = "never_registered_bin_#{System.unique_integer([:positive])}"
+
+      capture_log(fn ->
+        send(Mob.Wake.Registry, {:wake_fired, unknown})
+        Process.sleep(50)
+      end)
+
+      # Registry still alive.
+      assert Process.whereis(Mob.Wake.Registry) != nil
+      # Atom didn't get minted.
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown) end
+    end
+
     test "wake_result_atom: {:ok, :no_data} from a scheduler handler maps to :ok, not :error" do
       # Fix for the review's finding #2 — a scheduler handler returning
       # {:ok, :no_data} was being flattened to :error by the previous

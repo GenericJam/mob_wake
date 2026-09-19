@@ -143,7 +143,18 @@ defmodule Mob.Wake.Registry do
 
   defp identifier_to_atom(atom) when is_atom(atom), do: atom
 
+  # Native NIFs send the identifier as a BINARY (Zig
+  # enif_make_binary; ObjC nsstring_to_bin). Convert to atom via
+  # `identifier_to_atom/1` which uses String.to_existing_atom for
+  # atom-table safety. Unregistered identifiers (nil return) drop.
   @impl true
+  def handle_info({:wake_fired, identifier_bin}, s) when is_binary(identifier_bin) do
+    case identifier_to_atom(identifier_bin) do
+      nil -> {:noreply, s}
+      atom -> handle_info({:wake_fired, atom}, s)
+    end
+  end
+
   def handle_info({:wake_fired, identifier}, s) when is_atom(identifier) do
     # Native BGTask (iOS) / WorkManager (Android) fire. Dispatch under
     # the task supervisor so a slow handler doesn't back up further
