@@ -293,7 +293,6 @@ fn nif_complete_task(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL
         detachIfAttached(attached);
         return erts.atom(env, "error");
     }
-    defer jni.deleteLocalRef(jenv, id_str);
 
     // Exact match on the atom, not prefix — startsWith would misclassify
     // a future `:okay` / `:retry_soon` / etc. atom.
@@ -309,6 +308,12 @@ fn nif_complete_task(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL
             clearPendingJniException(jenv);
         }
     }
+
+    // Delete JNI local refs BEFORE detaching the thread. `defer` in Zig
+    // fires at scope exit AFTER any explicit statements — putting the
+    // deletes in defers ran them AFTER detachIfAttached, and CheckJNI
+    // aborted with "not attached" when validating DeleteLocalRef.
+    jni.deleteLocalRef(jenv, id_str);
     detachIfAttached(attached);
     return erts.ok(env);
 }
@@ -353,12 +358,16 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
         detachIfAttached(attached);
         return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "jstring_alloc_failed") });
     }
-    defer jni.deleteLocalRef(jenv, id_str);
-    defer jni.deleteLocalRef(jenv, trg_str);
 
     const ok = jenv.*.CallStaticBooleanMethod.?(jenv, g_wake_cls, g_wake.schedule_work, id_str, trg_str, @as(jni.JLong, earliest_ms), charging, unmetered);
     clearPendingJniException(jenv);
+
+    // Delete refs BEFORE detach (see complete_task for the CheckJNI abort
+    // this fixes).
+    jni.deleteLocalRef(jenv, id_str);
+    jni.deleteLocalRef(jenv, trg_str);
     detachIfAttached(attached);
+
     if (ok == 0) {
         return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "submit_failed") });
     }
