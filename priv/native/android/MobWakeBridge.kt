@@ -32,21 +32,38 @@
 // That completes the deferred and the Worker's doWork returns.
 package io.mob.wake
 
+import android.app.Activity
 import android.content.Context
+import io.mob.plugin.MobActivityAware
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
+import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
+import androidx.work.ListenableWorker
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
-import androidx.work.ListenableWorker
+import androidx.work.WorkerParameters
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 
-object MobWakeBridge {
+object MobWakeBridge : MobActivityAware {
+
+    /**
+     * Called by MobPluginBootstrap.handOff right after register(). We
+     * grab the Activity's applicationContext so scheduleWork can reach
+     * WorkManager.getInstance(context) before any Worker has fired.
+     */
+    override fun setActivity(activity: Activity) {
+        setAppContext(activity.applicationContext)
+    }
+
     // Per-identifier pending work registry. WorkManager gives us "one
     // in flight per identifier" semantics via ExistingWorkPolicy.REPLACE
     // when enqueueing — but if we've somehow ended up with a stale entry
@@ -63,6 +80,17 @@ object MobWakeBridge {
 
     fun setAppContext(ctx: Context) {
         appContext = ctx.applicationContext
+    }
+
+    /**
+     * Called by mob's generated MobPluginBootstrap.registerAll(activity)
+     * before setContent renders. This is where the JNI method-id cache
+     * is populated. Safe to call multiple times (nativeRegister just
+     * rebuilds the cache).
+     */
+    @JvmStatic
+    fun register() {
+        nativeRegister()
     }
 
     @JvmStatic external fun nativeRegister()
@@ -98,21 +126,22 @@ object MobWakeBridge {
      *   * `hasContext` — false when the bridge hasn't been given an app
      *     context yet; the query can't run in that state.
      *
-     * Returns a packed long: bit 0 = batteryOptimized, bit 1 = hasContext.
-     * Simpler than a full JNI object return; Zig decodes into the map.
+     * Returns a packed int: bit 0 = batteryOptimized, bit 1 = hasContext.
+     * Int (not Long) because mob's Zig JNI wrapper doesn't expose
+     * CallStaticLongMethod today; two flag bits fit easily in 32 bits.
      */
     @JvmStatic
-    fun platformSignal(): Long {
-        val ctx = appContext ?: return 0L  // hasContext=false, everything else 0
+    fun platformSignal(): Int {
+        val ctx = appContext ?: return 0  // hasContext=false, everything else 0
         val pm = ctx.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-            ?: return 0b10L  // hasContext=true, batteryOptimized=false (unknown)
+            ?: return 0b10  // hasContext=true, batteryOptimized=false (unknown)
         val optimized = if (android.os.Build.VERSION.SDK_INT >= 23) {
             !pm.isIgnoringBatteryOptimizations(ctx.packageName)
         } else {
             false
         }
-        var bits = 0b10L  // hasContext
-        if (optimized) bits = bits or 0b01L
+        var bits = 0b10  // hasContext
+        if (optimized) bits = bits or 0b01
         return bits
     }
 
@@ -225,4 +254,65 @@ object MobWakeBridge {
     // Server-side FCM data-message convention: the identifier lives under
     // this data-map key. Mirrors iOS's userInfo["mob_wake_id"].
     const val KEY_FCM_ID = "mob_wake_id"
+}
+
+// mob_wake plugin — WorkManager Worker (MOB-263).
+//
+// WorkManager's default WorkerFactory constructs this via the standard
+// (Context, WorkerParameters) constructor, so no custom
+// Configuration.Provider on the host Application is required. Public
+// constructor is mandatory — WorkManager reflects.
+//
+// doWork reads the identifier from inputData (put there by
+// MobWakeBridge.scheduleWork), hands off to the bridge's coroutine,
+// and returns the bridge's result verbatim.
+class MobWakeWorker(
+    context: Context,
+    params: WorkerParameters
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): ListenableWorker.Result {
+        val identifier = inputData.getString(MobWakeBridge.KEY_IDENTIFIER)
+            ?: return ListenableWorker.Result.failure()
+
+        // Ensure the bridge has an app context — safe to call
+        // idempotently. WorkManager may fire us before the mob
+        // Application has run its Context setup, so we self-heal here.
+        MobWakeBridge.setAppContext(applicationContext)
+
+        return MobWakeBridge.awaitBeamDispatch(identifier)
+    }
+}
+
+// mob_wake plugin — FCM data-message receiver (MOB-264).
+//
+// FCM delivers data-only messages via FirebaseMessagingService.onMessageReceived,
+// which runs on a worker thread with a ~10s wall-clock budget before
+// Android may kill the service. mob_wake convention: the message's
+// data map MUST contain a mob_wake_id key naming the identifier;
+// missing key = dropped.
+//
+// AndroidManifest.xml (host app, until MOB-265 codegen writes this):
+//
+//   <service
+//     android:name="io.mob.wake.MobWakeFcmService"
+//     android:exported="false">
+//     <intent-filter>
+//       <action android:name="com.google.firebase.MESSAGING_EVENT" />
+//     </intent-filter>
+//   </service>
+class MobWakeFcmService : FirebaseMessagingService() {
+
+    override fun onMessageReceived(remoteMessage: RemoteMessage) {
+        val data = remoteMessage.data
+        val identifier = data[MobWakeBridge.KEY_FCM_ID]
+        if (identifier.isNullOrEmpty()) return
+
+        val payloadJson = JSONObject(data as Map<String, Any>).toString()
+        MobWakeBridge.onPushFired(identifier, payloadJson)
+    }
+
+    override fun onNewToken(token: String) {
+        MobWakeBridge.onFcmTokenRefresh(token)
+    }
 }

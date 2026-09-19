@@ -76,11 +76,13 @@ inline fn detachIfAttached(attached: c_int) void {
 // propagate: mob_wake's Kotlin bridge shouldn't throw as part of normal
 // operation, so an exception here is a bug on the Kotlin side that
 // wants a Logcat entry, not a BEAM-side rethrow.
+//
+// mob's JNI struct wrapper doesn't expose ExceptionCheck (see comment in
+// mob_zig.zig), so we call ExceptionClear unconditionally — the JNI spec
+// says Clear is a no-op when no exception is pending, and mob's own
+// code uses the same pattern.
 inline fn clearPendingJniException(jenv: *jni.JNIEnv) void {
-    if (jenv.*.ExceptionCheck.?(jenv) != 0) {
-        jenv.*.ExceptionDescribe.?(jenv);
-        jenv.*.ExceptionClear.?(jenv);
-    }
+    jenv.*.ExceptionClear.?(jenv);
 }
 
 // Compare a fixed-size atom buffer (null-padded, from enif_get_atom) to
@@ -100,7 +102,7 @@ export fn Java_io_mob_wake_MobWakeBridge_nativeRegister(jenv: *jni.JNIEnv, cls: 
     g_wake.schedule_work = jni.getStaticMethodID(jenv, cls, "scheduleWork", "(Ljava/lang/String;Ljava/lang/String;JZZ)Z");
     g_wake.complete_work = jni.getStaticMethodID(jenv, cls, "completeWork", "(Ljava/lang/String;Z)V");
     g_wake.retry_work = jni.getStaticMethodID(jenv, cls, "retryWork", "(Ljava/lang/String;)V");
-    g_wake.platform_signal = jni.getStaticMethodID(jenv, cls, "platformSignal", "()J");
+    g_wake.platform_signal = jni.getStaticMethodID(jenv, cls, "platformSignal", "()I");
 }
 
 // ── Send helpers ─────────────────────────────────────────────────────────
@@ -246,23 +248,29 @@ fn nif_set_dispatcher_pid(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const ert
 fn nif_take_pending_wakes(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
     _ = argv;
-    var list = erts.enif_make_list(env, 0);
+    // Build an array of binary terms, then use enif_make_list_from_array
+    // to hand back the whole list at once. mob's mob_erts.zig wrapper
+    // doesn't expose the variadic enif_make_list; the array form is
+    // what's available and it's what we want anyway.
+    var buf: [MAX_PENDING]erts.ERL_NIF_TERM = undefined;
+    var out_len: usize = 0;
+
     erts.enif_mutex_lock(g_state_mutex);
     const count = g_pending_count;
-    var idx: usize = count;
-    while (idx > 0) {
-        idx -= 1;
+    var idx: usize = 0;
+    while (idx < count) : (idx += 1) {
         var bin: erts.ErlNifBinary = undefined;
         const n = g_pending_lens[idx];
         if (erts.enif_alloc_binary(n, &bin) != 0) {
             @memcpy(bin.data[0..n], g_pending[idx][0..n]);
-            const term = erts.enif_make_binary(env, &bin);
-            list = erts.enif_make_list_cell(env, term, list);
+            buf[out_len] = erts.enif_make_binary(env, &bin);
+            out_len += 1;
         }
     }
     g_pending_count = 0;
     erts.enif_mutex_unlock(g_state_mutex);
-    return list;
+
+    return erts.enif_make_list_from_array(env, &buf, @intCast(out_len));
 }
 
 fn nif_complete_task(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
@@ -314,9 +322,10 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
     if (erts.enif_get_atom(env, argv[1], &trigger_atom, trigger_atom.len, erts.ERL_NIF_LATIN1) == 0) return erts.badarg(env);
 
     // Elixir side flattens opts to explicit args — earliest_ms, charging,
-    // unmetered. See Mob.Wake.flatten_opts/1.
-    var earliest_ms: c_long = 0;
-    if (erts.enif_get_long(env, argv[2], &earliest_ms) == 0) return erts.badarg(env);
+    // unmetered. See Mob.Wake.flatten_opts/1. c_int is enough for
+    // reasonable delays (~2.1B ms ≈ 24 days).
+    var earliest_ms: c_int = 0;
+    if (erts.enif_get_int(env, argv[2], &earliest_ms) == 0) return erts.badarg(env);
     if (earliest_ms < 0) return erts.badarg(env);
 
     var charging_atom: [8]u8 = @splat(0);
@@ -329,11 +338,11 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
 
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse {
-        return erts.tuple2(env, erts.atom(env, "error"), erts.atom(env, "no_jenv"));
+        return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "no_jenv") });
     };
     if (g_wake_cls == null or g_wake.schedule_work == null) {
         detachIfAttached(attached);
-        return erts.tuple2(env, erts.atom(env, "error"), erts.atom(env, "bridge_not_registered"));
+        return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "bridge_not_registered") });
     }
 
     const id_str = jni.newStringUTF(jenv, jni.asCStr(&id_buf));
@@ -342,7 +351,7 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
         if (id_str != null) jni.deleteLocalRef(jenv, id_str);
         if (trg_str != null) jni.deleteLocalRef(jenv, trg_str);
         detachIfAttached(attached);
-        return erts.tuple2(env, erts.atom(env, "error"), erts.atom(env, "jstring_alloc_failed"));
+        return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "jstring_alloc_failed") });
     }
     defer jni.deleteLocalRef(jenv, id_str);
     defer jni.deleteLocalRef(jenv, trg_str);
@@ -351,7 +360,7 @@ fn nif_schedule(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_
     clearPendingJniException(jenv);
     detachIfAttached(attached);
     if (ok == 0) {
-        return erts.tuple2(env, erts.atom(env, "error"), erts.atom(env, "submit_failed"));
+        return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "submit_failed") });
     }
     return erts.ok(env);
 }
@@ -394,30 +403,40 @@ fn nif_complete_push_noop(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const ert
 fn nif_platform_signal(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
     _ = argv;
+
+    // Empty-map default for the "can't tell right now" paths (NIF loaded
+    // but JNI env unavailable or bridge not registered). Same shape the
+    // Elixir side falls back to on host when the NIF itself is absent.
+    var empty_keys: [0]erts.ERL_NIF_TERM = undefined;
+    var empty_vals: [0]erts.ERL_NIF_TERM = undefined;
+    var empty_map: erts.ERL_NIF_TERM = undefined;
+    _ = erts.enif_make_map_from_arrays(env, &empty_keys, &empty_vals, 0, &empty_map);
+
     var attached: c_int = 0;
-    const jenv = get_jenv(&attached) orelse return erts.enif_make_new_map(env);
+    const jenv = get_jenv(&attached) orelse return empty_map;
     if (g_wake_cls == null or g_wake.platform_signal == null) {
         detachIfAttached(attached);
-        return erts.enif_make_new_map(env);
+        return empty_map;
     }
-    const bits = jenv.*.CallStaticLongMethod.?(jenv, g_wake_cls, g_wake.platform_signal);
+    const bits = jenv.*.CallStaticIntMethod.?(jenv, g_wake_cls, g_wake.platform_signal);
     clearPendingJniException(jenv);
     detachIfAttached(attached);
 
     const battery_optimized: bool = (bits & 0b01) != 0;
     const has_context: bool = (bits & 0b10) != 0;
 
-    var map = erts.enif_make_new_map(env);
-    var out: erts.ERL_NIF_TERM = undefined;
-    _ = erts.enif_make_map_put(env, map,
+    // Build the returned map in one shot via enif_make_map_from_arrays —
+    // mob's mob_erts.zig doesn't expose enif_make_map_put, only the
+    // arrays-form.
+    var keys = [_]erts.ERL_NIF_TERM{
         erts.atom(env, "battery_optimized"),
-        erts.atom(env, if (battery_optimized) "true" else "false"),
-        &out);
-    map = out;
-    _ = erts.enif_make_map_put(env, map,
         erts.atom(env, "has_context"),
-        erts.atom(env, if (has_context) "true" else "false"),
-        &out);
+    };
+    const bo_atom = if (battery_optimized) erts.atom(env, "true") else erts.atom(env, "false");
+    const hc_atom = if (has_context) erts.atom(env, "true") else erts.atom(env, "false");
+    var vals = [_]erts.ERL_NIF_TERM{ bo_atom, hc_atom };
+    var out: erts.ERL_NIF_TERM = undefined;
+    if (erts.enif_make_map_from_arrays(env, &keys, &vals, keys.len, &out) == 0) return empty_map;
     return out;
 }
 
