@@ -172,14 +172,24 @@ static void send_push_fired(ErlNifPid *pid, NSString *identifier,
   // NO to iOS via setTaskCompletedWithSuccess: even though BEAM may
   // still be running the handler — the platform contract is that
   // expirationHandler must be honored.
+  //
+  // __weak on `task` avoids a retain cycle: the block is retained by
+  // task.expirationHandler, and a strong `task` capture inside the
+  // block would then keep the task alive forever after the fire
+  // resolved. `identifier` is captured by value (NSString *; ARC
+  // handles the strong retain of the NSString itself, which is
+  // separate from the task lifecycle).
+  __weak BGTask *weakTask = task;
   task.expirationHandler = ^{
+    BGTask *strongTask = weakTask;
+    if (strongTask == nil) return;
     // Grab-and-drop under lock so we don't race with complete_task.
     enif_mutex_lock(g_mutex);
-    if (g_bg_tasks[identifier] == task) {
+    if (g_bg_tasks[identifier] == strongTask) {
       [g_bg_tasks removeObjectForKey:identifier];
     }
     enif_mutex_unlock(g_mutex);
-    [task setTaskCompletedWithSuccess:NO];
+    [strongTask setTaskCompletedWithSuccess:NO];
   };
 
   ErlNifPid pid_snapshot;
