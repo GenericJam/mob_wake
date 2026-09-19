@@ -65,6 +65,48 @@ defmodule MobWake do
 
   When execution timing matters, prefer push over scheduler.
 
+  ### Silent push — three device states (physical device verified)
+
+  For a `:push`-triggered handler, the wake fires end-to-end when the
+  app is in one of the first two states below; the third state is a
+  documented drop-through-no-fault-of-mob_wake:
+
+  | Device state              | Silent-push wake result                                   |
+  |---------------------------|----------------------------------------------------------|
+  | **Foreground**            | Handler runs immediately.                                |
+  | **Backgrounded** (home button / another app on top, BEAM alive) | Handler runs — the primary use case mob_wake exists for. |
+  | **Force-stopped** (Settings → Force Stop, or user swipe from recents on some OEM launchers) | Wake is **dropped**. Both platforms refuse to deliver silent pushes to a killed app: FCM (Android) queues as `FcmRetry` and does not deliver even after the user relaunches; APNs (iOS) treats a force-quit app the same. This is Google's and Apple's design; mob_wake cannot work around it. |
+
+  ### Cold-start-via-push on Android — the rarer failure mode
+
+  A wake that arrives while BEAM is dead (not force-stopped — Android
+  killed the BEAM process for memory / OEM battery reasons but the
+  app itself is not force-stopped) causes Android to relaunch the app
+  process just to run `FirebaseMessagingService`. In that state:
+
+    * The Kotlin `MobWakeBridge` class is loaded (JVM sees the class
+      via the DEX) but its `native` methods have no JNI implementation
+      — the mob native library is loaded from `mob_boot_runtime()` on
+      Activity start, and there is no Activity in a service-only
+      relaunch.
+    * A naive `MobWakeBridge.onPushFired` call throws
+      `UnsatisfiedLinkError` on `nativeDeliverPush`, which crashes the
+      service and makes Android keep retrying it.
+
+  The host app's `MobFirebaseService` — which is where FCM messages
+  actually land, because Android only allows one service registered
+  per `com.google.firebase.MESSAGING_EVENT` — must catch
+  `java.lang.reflect.InvocationTargetException` around the reflective
+  call and swallow it. The wake is lost (this cold-start-into-service
+  case is a real limitation; loading the native library from the
+  service side is a mob-framework change, not a plugin change), but
+  the service stays alive and subsequent visible-push deliveries via
+  mob_notify continue to work.
+
+  See `MobFirebaseService.kt` in mob_new's Android template (or in a
+  hand-wired host app) for the exact catch pattern; commit `b040949`
+  in `~/code/sloppy_joe` is the reference implementation.
+
   ### Direction of travel
 
   Since ~2015 both platforms have been moving away from scheduled
