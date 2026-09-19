@@ -169,16 +169,29 @@ object MobWakeBridge : MobActivityAware {
         // sits and waits until complete_task fires.
         nativeDeliverWake(identifier)
 
-        // 9 minutes — a bit under WorkManager's practical 10-minute
-        // upper bound for a single Worker, so we surface a timeout
-        // before WorkManager kills us and mis-attributes the failure.
-        val result = withTimeoutOrNull(9L * 60L * 1000L) { deferred.await() }
-        // Remove ONLY if the entry is still this deferred — completeWork
-        // may already have removed it. remove(key, expectedValue) is
-        // the atomic compare-and-remove; a mismatch means someone else
-        // already completed us and we shouldn't clobber their state.
-        pendingWork.remove(identifier, deferred)
-        return result ?: ListenableWorker.Result.failure()
+        return try {
+            // 9 minutes — a bit under WorkManager's practical 10-minute
+            // upper bound for a single Worker, so we surface a timeout
+            // before WorkManager kills us and mis-attributes the failure.
+            val result = withTimeoutOrNull(9L * 60L * 1000L) { deferred.await() }
+            result ?: ListenableWorker.Result.failure()
+        } finally {
+            // Clean up under try/finally so a WorkManager cancellation
+            // (ExistingWorkPolicy.REPLACE by a later schedule call,
+            // battery-optimization kill, or coroutine cancellation for
+            // any other reason) doesn't LEAK the deferred in pendingWork.
+            // A leaked entry causes every subsequent Worker for the
+            // same identifier to hit putIfAbsent's collision branch
+            // and return Result.retry() forever. Physical device caught
+            // this: MOB-268 verification on Moto G Power 2021 saw
+            // "WM-WorkerWrapper: Worker result RETRY" after a
+            // scheduling churn had left stale entries.
+            //
+            // remove(key, expectedValue) is the atomic compare-and-remove
+            // — completeWork may already have removed it, in which case
+            // this is a no-op.
+            pendingWork.remove(identifier, deferred)
+        }
     }
 
     /** Called from Zig NIF's complete_task thunk. */
