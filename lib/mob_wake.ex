@@ -65,6 +65,38 @@ defmodule MobWake do
 
   When execution timing matters, prefer push over scheduler.
 
+  ### iOS silent APNs — first-time setup prerequisites (MOB-271)
+
+  The `mob_new` template ships the code side of push wired: the
+  AppDelegate forwards the device token to Elixir via
+  `mob_send_push_token`, the AppDelegate logs
+  `didFailToRegisterForRemoteNotificationsWithError:`, the Info.plist
+  declares `UIBackgroundModes.remote-notification`, and `mob_dev`'s
+  codesign step calls `codesign --entitlements` with a file that mirrors
+  `aps-environment` from the embedded provisioning profile.
+
+  The out-of-band Apple Developer work stays on the host-app owner's
+  plate. Do all three before expecting a push token to ever arrive:
+
+    1. **Enable Push Notifications capability** on the App ID in Apple
+       Developer Portal (Certificates, Identifiers & Profiles → App IDs
+       → your app → Capabilities → Push Notifications).
+    2. **Regenerate the provisioning profile** used for signing. Xcode
+       may cache the old one; a "download all profiles" from Apple
+       Developer settings, or a manual profile download, is the
+       reliable path.
+    3. **Provision an APNs authentication key (or certificate)** and
+       configure `mob_push` on the send side with it. Without this the
+       server can't send anything even if the device would receive it.
+
+  Symptom when any of these three is missing: `MobNotify.register_push/1`
+  succeeds silently, no `{:push_token, :ios, _}` message ever arrives
+  at the calling process, and `MobPush.send/3` for that identity fails
+  with `:device_token_not_found`. Look at the iOS system log (Xcode
+  Console, `xcrun devicectl device console`, `idevicesyslog`) for the
+  `[Mob] Failed to register for remote notifications:` line — the
+  underlying `NSError` names which of the three is missing.
+
   ### Silent push — three device states (physical device verified)
 
   For a `:push`-triggered handler, the wake fires end-to-end when the
