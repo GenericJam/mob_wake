@@ -14,22 +14,34 @@ defmodule MobWake do
   `Mob.Wake.dispatch/1`, we run to completion inside the platform's task
   window, native marks the task done.
 
-  ## What this plugin is NOT
+  ## Which plugin do I actually want?
 
-  * **Not `mob_background`** (already on Hex). That's the keep-alive
-    pattern — silent-audio session on iOS, foreground service with
-    notification on Android — for staying alive while the user is on
-    another screen. Different lifecycle, different entitlements, different
-    user-visibility rules.
-  * **Not the send-side of push.** `mob_push` (in progress) is the *send*
-    side of silent APNs / FCM. `mob_wake` is the *receive* side. Both
+  The push/background/wake/notify quartet sits next to each other in the
+  catalog and gets mixed up regularly. Four distinct concerns:
+
+  | I want to…                                             | Plugin                                                            |
+  |--------------------------------------------------------|-------------------------------------------------------------------|
+  | **Send** a push from my server                         | [`mob_push`](https://hexdocs.pm/mob_push) (server-side; no device code) |
+  | **Receive** a push token on the device and register it | [`mob_notify`](https://hexdocs.pm/mob_notify) (device-side)       |
+  | Run a handler when the OS wakes my app opportunistically or via silent push | **`mob_wake`** (this plugin) |
+  | Keep my app alive while the user is on another screen  | [`mob_background`](https://hexdocs.pm/mob_background) (silent-audio on iOS, foreground service on Android) |
+
+  * **`mob_wake` vs `mob_background`:** wake is *event-driven* — the OS
+    (or a silent push) fires a specific handler, it runs to completion,
+    the platform reports done. Background is a *keep-alive* — the app
+    stays running while backgrounded so *your own* code (an active
+    upload, a walking tracker, a music player) can keep going. They
+    stack: an app can use both, and often should.
+  * **`mob_wake` vs the send side:** `mob_push` builds and sends the
+    push; `mob_wake` receives and dispatches it on-device. Both
     coordinate on the identifier scheme so a task scheduled here can be
-    triggered via push there without duplication.
-  * **Not a replacement for the OS's own reasoning.** iOS's
-    `BGTaskScheduler` is deliberately opportunistic — it fires when iOS
-    decides the user is likely to open the app soon and the device has
-    energy budget to spare. Do not treat it as cron. See the reliability
-    story below.
+    triggered via push there without duplication (see `wake_payload/2`).
+  * **`mob_wake` vs the scheduler API alone:** iOS's `BGTaskScheduler`
+    is deliberately opportunistic — it fires when iOS decides the user
+    is likely to open the app soon and the device has energy budget to
+    spare. Do not treat it as cron. See the reliability story below.
+    When timing matters, prefer a `:push`-triggered handler over a
+    `:refresh` / `:processing` one.
 
   ## The honest reliability story
 
@@ -97,17 +109,19 @@ defmodule MobWake do
   `[Mob] Failed to register for remote notifications:` line — the
   underlying `NSError` names which of the three is missing.
 
-  ### Silent push — three device states (physical device verified)
+  ### Silent push — three device states (both platforms verified on hardware)
 
   For a `:push`-triggered handler, the wake fires end-to-end when the
   app is in one of the first two states below; the third state is a
-  documented drop-through-no-fault-of-mob_wake:
+  documented drop-through-no-fault-of-mob_wake. Verified 2026-09-19 on
+  a Moto G Power 5G 2024 (Android FCM data messages) and an iPhone SE
+  3rd-gen (iOS silent APNs, sandbox environment):
 
   | Device state              | Silent-push wake result                                   |
   |---------------------------|----------------------------------------------------------|
-  | **Foreground**            | Handler runs immediately.                                |
-  | **Backgrounded** (home button / another app on top, BEAM alive) | Handler runs — the primary use case mob_wake exists for. |
-  | **Force-stopped** (Settings → Force Stop, or user swipe from recents on some OEM launchers) | Wake is **dropped**. Both platforms refuse to deliver silent pushes to a killed app: FCM (Android) queues as `FcmRetry` and does not deliver even after the user relaunches; APNs (iOS) treats a force-quit app the same. This is Google's and Apple's design; mob_wake cannot work around it. |
+  | **Foreground**            | Handler runs immediately. Verified 0 → 2 (two consecutive fires bumped a persisted counter). |
+  | **Backgrounded** (home button / another app on top, BEAM alive or suspended) | Handler runs — the primary use case mob_wake exists for. iOS specifically: BEAM may already be suspended when the push arrives; iOS wakes it long enough for the completion handler, then re-suspends. Verified via a DETS counter that only the on-device handler writes — pulled off the device with `xcrun devicectl device copy from`. |
+  | **Force-stopped** (Settings → Force Stop / user swipe from recents on some Android launchers / user swipe-up-off-top-of-recents on iOS) | Wake is **dropped**. Both platforms refuse to deliver silent pushes to a user-terminated app: FCM (Android) queues as `FcmRetry` and does not deliver even after the user relaunches; APNs (iOS) treats a force-quit app the same. This is Google's and Apple's design; mob_wake cannot work around it. |
 
   ### Cold-start-via-push on Android — the rarer failure mode
 
