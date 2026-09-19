@@ -122,7 +122,7 @@ defmodule Mob.Wake.RegistryTest do
       end)
 
       # Registry still alive.
-      assert Process.whereis(Mob.Wake.Registry) != nil
+      assert is_pid(Process.whereis(Mob.Wake.Registry))
       # Atom didn't get minted.
       assert_raise ArgumentError, fn -> String.to_existing_atom(unknown) end
     end
