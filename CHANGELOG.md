@@ -6,7 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
-## [Unreleased]
+## [0.1.2] - 2026-10-09
 
 ### Added
 
@@ -16,11 +16,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
   `background_refresh_status` passes; on Android the bridge must answer
   with `has_context: true`. A missing context, an unregistered bridge or
   the host stub's `nif_not_loaded` fail. Run it with `mix mob.selftest`
-  from a host app (mob_dev 0.7.17). Requires mob 0.9.15; `mob_version` in
-  the manifest is now `~> 0.9`.
+  from a host app (mob_dev 0.7.17).
 
 ### Changed
 
+- Requires mob >= 0.9.15 (mix dep was `~> 0.9.1`, now
+  `~> 0.9 and >= 0.9.15`), for `Mob.Plugin.SelfTest`; `mob_version` in the
+  manifest is now `~> 0.9` (was `~> 0.9.1`).
 - **Android: `platform_signal/0` reports an unregistered bridge.** The NIF
   answers `{:error, :bridge_not_registered}` when
   `MobWakeBridge.register()` never ran or the method-ID lookup failed,

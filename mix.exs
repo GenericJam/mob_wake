@@ -2,7 +2,7 @@ defmodule MobWake.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/GenericJam/mob_wake"
-  @version "0.1.1"
+  @version "0.1.2"
 
   def project do
     [

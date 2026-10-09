@@ -205,7 +205,7 @@ defmodule MobWake do
 
   ## Requirements
 
-  * mob `~> 0.9.1`
+  * mob `~> 0.9 and >= 0.9.15`
   * iOS: BackgroundTasks + UserNotifications frameworks (declared in the
     plugin manifest). BGTaskScheduler identifiers land in Info.plist
     from mob_new codegen based on `config :mob_wake, :tasks`.

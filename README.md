@@ -36,7 +36,7 @@ If your feature genuinely requires guaranteed periodic execution — accounting 
 ```elixir
 def deps do
   [
-    {:mob,      "~> 0.9.1"},
+    {:mob,      "~> 0.9 and >= 0.9.15"},
     {:mob_wake, "~> 0.1"}
   ]
 end
