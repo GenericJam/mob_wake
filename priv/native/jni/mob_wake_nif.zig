@@ -405,30 +405,26 @@ fn nif_complete_push_noop(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const ert
     return erts.ok(env);
 }
 
-// {error, Reason} for the paths where the NIF is linked but cannot ask the
-// bridge. Mob.Wake.status/1 folds these into an empty map ("can't tell right
-// now"); MobWake.SelfTest turns them into failures (MOB-418).
-fn errorTuple(env: ?*erts.ErlNifEnv, comptime reason: [:0]const u8) erts.ERL_NIF_TERM {
-    return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, reason) });
-}
-
 // platform_signal/0 → %{battery_optimized: bool, has_context: bool}
 // Wraps MobWakeBridge.platformSignal() which returns a bit-packed int:
 // bit 0 = batteryOptimized, bit 1 = hasContext. `has_context` distinguishes
 // "app is whitelisted" from "we can't tell yet" (bridge boot race).
 //
 // {error, bridge_not_registered} when MobWakeBridge.register() never ran
-// (nativeRegister never cached the class) or the platformSignal method-ID
-// lookup failed; {error, no_jni_env} when this thread can't get a JNIEnv.
-// These used to return %{} — the same answer as a host with no NIF — so a
-// host app whose bootstrap never registered the bridge looked healthy.
+// (the plugin bootstrap never registered the bridge) or the platformSignal
+// method-ID lookup failed; {error, no_jni_env} when this thread can't get a
+// JNIEnv; {error, map_build_failed} if the result map can't be built. These
+// used to return %{} — the same answer as a host with no NIF — so a host app
+// whose bootstrap never registered the bridge looked healthy.
+// Mob.Wake.status/1 folds them into %{} ("can't tell right now");
+// MobWake.SelfTest turns them into failures (MOB-418).
 fn nif_platform_signal(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
     _ = argv;
 
-    if (g_wake_cls == null or g_wake.platform_signal == null) return errorTuple(env, "bridge_not_registered");
+    if (g_wake_cls == null or g_wake.platform_signal == null) return erts.errorTuple(env, erts.atom(env, "bridge_not_registered"));
     var attached: c_int = 0;
-    const jenv = get_jenv(&attached) orelse return errorTuple(env, "no_jni_env");
+    const jenv = get_jenv(&attached) orelse return erts.errorTuple(env, erts.atom(env, "no_jni_env"));
     const bits = jenv.*.CallStaticIntMethod.?(jenv, g_wake_cls, g_wake.platform_signal);
     clearPendingJniException(jenv);
     detachIfAttached(attached);
@@ -447,7 +443,7 @@ fn nif_platform_signal(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.E
     const hc_atom = if (has_context) erts.atom(env, "true") else erts.atom(env, "false");
     var vals = [_]erts.ERL_NIF_TERM{ bo_atom, hc_atom };
     var out: erts.ERL_NIF_TERM = undefined;
-    if (erts.enif_make_map_from_arrays(env, &keys, &vals, keys.len, &out) == 0) return errorTuple(env, "map_build_failed");
+    if (erts.enif_make_map_from_arrays(env, &keys, &vals, keys.len, &out) == 0) return erts.errorTuple(env, erts.atom(env, "map_build_failed"));
     return out;
 }
 

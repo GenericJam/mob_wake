@@ -1,5 +1,7 @@
 %{
   name: :mob_wake,
+  # Coarse manifest range (same as the other mob plugins); the real floor,
+  # mob >= 0.9.15 for Mob.Plugin.SelfTest, is enforced by mix.exs.
   mob_version: "~> 0.9",
   plugin_spec_version: 1,
   # On-device proof for `mix mob.selftest` / mob_ci: one read-only

@@ -36,9 +36,9 @@ defmodule MobWake.SelfTest do
   @impl true
   def run(%{platform: platform}) do
     classify(platform, :mob_wake_nif.platform_signal())
-  rescue
-    e in ErlangError ->
-      {:fail, "mob_wake_nif is not linked into this build: #{Exception.message(e)}"}
+  catch
+    :error, :nif_not_loaded ->
+      {:fail, "mob_wake_nif is not linked into this build (nif_not_loaded)"}
   end
 
   @doc false
@@ -58,7 +58,7 @@ defmodule MobWake.SelfTest do
   def classify(:android, {:error, :bridge_not_registered}),
     do:
       {:fail,
-       "Kotlin MobWakeBridge not registered (nativeRegister never ran or a method-ID lookup failed)"}
+       "Kotlin MobWakeBridge not registered (the plugin bootstrap never called MobWakeBridge.register(), or a method-ID lookup failed)"}
 
   def classify(:android, {:error, :no_jni_env}),
     do: {:fail, "platform_signal/0 could not get a JNIEnv on this thread"}

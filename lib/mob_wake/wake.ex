@@ -233,14 +233,18 @@ defmodule Mob.Wake do
   # tell right now" — same shape as the platform_signal starting
   # value. `MobWake.SelfTest` is what turns those answers into failures.
   defp platform_signal do
-    case :mob_wake_nif.platform_signal() do
-      %{} = signal -> signal
-      {:error, _reason} -> %{}
-    end
+    normalize_platform_signal(:mob_wake_nif.platform_signal())
   catch
     :error, :undef -> %{}
     :error, :nif_not_loaded -> %{}
   end
+
+  @doc false
+  # The NIF's answer as status/1 reports it: the map as-is, anything else
+  # (Android's {:error, reason}, an unexpected term) as %{}.
+  @spec normalize_platform_signal(term()) :: map()
+  def normalize_platform_signal(%{} = signal), do: signal
+  def normalize_platform_signal(_other), do: %{}
 
   @doc """
   Inventory of all pending fires.
