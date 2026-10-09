@@ -1,7 +1,10 @@
 %{
   name: :mob_wake,
-  mob_version: "~> 0.9.1",
+  mob_version: "~> 0.9",
   plugin_spec_version: 1,
+  # On-device proof for `mix mob.selftest` / mob_ci: one read-only
+  # platform_signal/0 round trip through the NIF (see MobWake.SelfTest).
+  selftest: MobWake.SelfTest,
   # Description lives in mix.exs (Hex's source of truth). The plugin manifest
   # schema does not accept a top-level :description key today.
   #

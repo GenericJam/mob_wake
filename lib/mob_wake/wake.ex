@@ -227,11 +227,16 @@ defmodule Mob.Wake do
 
   # Fetches the per-platform reliability signal via the NIF.
   # On host / iOS-below-13 / non-mob-Android builds the NIF is absent
-  # and we return %{}. Callers should treat an empty map as "we can't
+  # and we return %{}. On Android the NIF answers `{:error, reason}`
+  # when the Kotlin bridge isn't registered or there's no JNIEnv; that
+  # also folds to %{}. Callers should treat an empty map as "we can't
   # tell right now" — same shape as the platform_signal starting
-  # value.
+  # value. `MobWake.SelfTest` is what turns those answers into failures.
   defp platform_signal do
-    :mob_wake_nif.platform_signal()
+    case :mob_wake_nif.platform_signal() do
+      %{} = signal -> signal
+      {:error, _reason} -> %{}
+    end
   catch
     :error, :undef -> %{}
     :error, :nif_not_loaded -> %{}

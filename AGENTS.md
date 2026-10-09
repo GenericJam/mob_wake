@@ -30,6 +30,7 @@ The rule of thumb: whenever a doc claims a task will run, ask yourself "even for
 
 * `lib/mob_wake.ex` — top-level @moduledoc + type aliases. Reliability story lives here canonically.
 * `lib/mob_wake/wake.ex` — `Mob.Wake` public API. All function bodies raise until the corresponding MOB-260..267 issue lands.
+* `lib/mob_wake/self_test.ex` — `MobWake.SelfTest` (`Mob.Plugin.SelfTest`, the manifest's `selftest:`), run by `mix mob.selftest` / mob_ci. One read-only `platform_signal/0` call; on Android it fails unless the bridge is registered and has an app context, so keep the Zig NIF answering `{:error, :bridge_not_registered}` rather than `%{}` when the bridge isn't there.
 * `priv/mob_plugin.exs` — plugin manifest. Declares `BackgroundTasks` + `UserNotifications` frameworks on iOS, `POST_NOTIFICATIONS` on Android, empty `screens` / `nifs`. `nifs` gets populated per MOB-261..264.
 * `priv/native/ios/` — iOS NIF sources (MOB-261 + MOB-262). Objective-C, wraps BGTaskScheduler + `application(_:didReceiveRemoteNotification:fetchCompletionHandler:)`.
 * `priv/native/jni/` — Android JNI NIF sources (MOB-263 + MOB-264). Zig, exports the bridge symbols the Kotlin side calls.
