@@ -23,10 +23,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 - **Android: `platform_signal/0` reports an unregistered bridge.** The NIF
   answers `{:error, :bridge_not_registered}` when
-  `MobWakeBridge.register()` never ran or the method-ID lookup failed, and
-  `{:error, :no_jni_env}` when it can't get a JNIEnv, instead of `%{}` (the
-  same answer as a host with no NIF). `Mob.Wake.status/1` still reports
-  `platform_signal: %{}` in those cases.
+  `MobWakeBridge.register()` never ran or the method-ID lookup failed,
+  `{:error, :no_jni_env}` when it can't get a JNIEnv, and
+  `{:error, :map_build_failed}` if the result map can't be built, instead
+  of `%{}` (the same answer as a host with no NIF). `Mob.Wake.status/1`
+  still reports `platform_signal: %{}` in those cases.
 
 ## [0.1.1] - 2026-09-30
 
