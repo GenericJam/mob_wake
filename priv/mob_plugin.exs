@@ -1,7 +1,12 @@
 %{
   name: :mob_wake,
-  mob_version: "~> 0.9.1",
+  # Coarse manifest range (same as the other mob plugins); the real floor,
+  # mob >= 0.9.15 for Mob.Plugin.SelfTest, is enforced by mix.exs.
+  mob_version: "~> 0.9",
   plugin_spec_version: 1,
+  # On-device proof for `mix mob.selftest` / mob_ci: one read-only
+  # platform_signal/0 round trip through the NIF (see MobWake.SelfTest).
+  selftest: MobWake.SelfTest,
   # Description lives in mix.exs (Hex's source of truth). The plugin manifest
   # schema does not accept a top-level :description key today.
   #

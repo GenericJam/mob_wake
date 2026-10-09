@@ -2,6 +2,7 @@ defmodule MobWakeTest do
   use ExUnit.Case, async: true
 
   alias MobDev.Plugin.{Manifest, Validator}
+  alias MobWake.SelfTest
 
   @plugin_dir Path.expand("..", __DIR__)
 
@@ -19,10 +20,10 @@ defmodule MobWakeTest do
       assert %{errors: []} = Validator.validate_plugin(m, @plugin_dir)
     end
 
-    test "requires mob 0.9.1 or newer", %{manifest: m} do
-      # mob 0.9.1 is the first release with the plugin manifest schema mob_wake
-      # depends on. Older mobs don't validate our manifest shape.
-      assert m.mob_version == "~> 0.9.1"
+    test "declares the self-test, which passes the validator without a warning", %{manifest: m} do
+      assert m.selftest == MobWake.SelfTest
+      assert %{errors: [], warnings: warnings} = Validator.validate_plugin(m, @plugin_dir)
+      refute Enum.any?(warnings, &(&1 =~ "selftest"))
     end
 
     test "declares BackgroundTasks + UserNotifications frameworks on iOS", %{manifest: m} do
@@ -40,6 +41,78 @@ defmodule MobWakeTest do
       # 13+ runtime permission. Not required for the wake itself; declared
       # here so mob_new's permission merge surfaces it once, not per-app.
       assert "android.permission.POST_NOTIFICATIONS" in m.android.permissions
+    end
+  end
+
+  describe "MobWake.SelfTest" do
+    defp assert_result(result) do
+      assert Mob.Plugin.SelfTest.result?(result)
+      result
+    end
+
+    test "on a host with no native library linked it fails, naming the NIF, instead of raising" do
+      for platform <- [:ios, :android] do
+        assert {:fail, reason} =
+                 assert_result(SelfTest.run(%{platform: platform, device: :simulator}))
+
+        assert reason =~ "mob_wake_nif is not linked"
+        assert reason =~ "nif_not_loaded"
+      end
+    end
+
+    test "iOS passes on every backgroundRefreshStatus the NIF can report" do
+      for status <- [:available, :denied, :restricted] do
+        assert :pass ==
+                 assert_result(SelfTest.classify(:ios, %{background_refresh_status: status}))
+      end
+    end
+
+    test "iOS fails on an unknown status, an empty map or the Android shape" do
+      for answer <- [
+            %{background_refresh_status: :bogus},
+            %{},
+            %{battery_optimized: false, has_context: true}
+          ] do
+        assert {:fail, "platform_signal/0 on ios returned " <> _} =
+                 assert_result(SelfTest.classify(:ios, answer))
+      end
+    end
+
+    test "Android passes once the bridge answered with an app context, whatever the battery setting" do
+      for optimized <- [true, false] do
+        assert :pass ==
+                 assert_result(
+                   SelfTest.classify(:android, %{battery_optimized: optimized, has_context: true})
+                 )
+      end
+    end
+
+    test "Android fails when the bridge never got an app context" do
+      assert {:fail, "MobWakeBridge has no app context" <> _} =
+               assert_result(
+                 SelfTest.classify(:android, %{battery_optimized: false, has_context: false})
+               )
+    end
+
+    test "Android fails when the NIF reports the bridge unregistered or no JNIEnv" do
+      assert {:fail, "Kotlin MobWakeBridge not registered" <> _} =
+               assert_result(SelfTest.classify(:android, {:error, :bridge_not_registered}))
+
+      assert {:fail, "platform_signal/0 could not get a JNIEnv" <> _} =
+               assert_result(SelfTest.classify(:android, {:error, :no_jni_env}))
+    end
+
+    test "Android fails on the pre-fix empty map, the iOS shape or an unexpected answer" do
+      for answer <- [
+            %{},
+            %{background_refresh_status: :available},
+            %{battery_optimized: :maybe, has_context: true},
+            {:error, :map_build_failed},
+            :ok
+          ] do
+        assert {:fail, "platform_signal/0 on android returned " <> _} =
+                 assert_result(SelfTest.classify(:android, answer))
+      end
     end
   end
 

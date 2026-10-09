@@ -6,6 +6,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **On-device self-test** (MOB-418). `MobWake.SelfTest` implements
+  `Mob.Plugin.SelfTest` and is declared in the manifest as `selftest:`.
+  It makes one read-only `:mob_wake_nif.platform_signal/0` call: on iOS any
+  `background_refresh_status` passes; on Android the bridge must answer
+  with `has_context: true`. A missing context, an unregistered bridge or
+  the host stub's `nif_not_loaded` fail. Run it with `mix mob.selftest`
+  from a host app (mob_dev 0.7.17). Requires mob 0.9.15; `mob_version` in
+  the manifest is now `~> 0.9`.
+
+### Changed
+
+- **Android: `platform_signal/0` reports an unregistered bridge.** The NIF
+  answers `{:error, :bridge_not_registered}` when
+  `MobWakeBridge.register()` never ran or the method-ID lookup failed,
+  `{:error, :no_jni_env}` when it can't get a JNIEnv, and
+  `{:error, :map_build_failed}` if the result map can't be built, instead
+  of `%{}` (the same answer as a host with no NIF). `Mob.Wake.status/1`
+  still reports `platform_signal: %{}` in those cases.
+
 ## [0.1.1] - 2026-09-30
 
 ### Changed

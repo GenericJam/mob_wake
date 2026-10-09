@@ -205,6 +205,17 @@ defmodule Mob.WakeTest do
       assert s.platform_signal == %{}
     end
 
+    test "reports the NIF's map as-is and folds Android's error answers into %{}" do
+      ios = %{background_refresh_status: :denied}
+      android = %{battery_optimized: true, has_context: true}
+      assert Mob.Wake.normalize_platform_signal(ios) == ios
+      assert Mob.Wake.normalize_platform_signal(android) == android
+
+      for answer <- [{:error, :bridge_not_registered}, {:error, :no_jni_env}, :unexpected] do
+        assert Mob.Wake.normalize_platform_signal(answer) == %{}
+      end
+    end
+
     test "reflects last_fired_at after a dispatch" do
       id = unique_tag(:stat_fire)
       :ok = Mob.Wake.register(id, :refresh, {TestHandlers, :echo_ok})

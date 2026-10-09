@@ -148,6 +148,8 @@ Under the `Mob.Wake` namespace. Full contract in the module's @moduledoc.
 * `Mob.Wake.status/1` — health + platform-specific reliability signals
 * `Mob.Wake.pending/0` — inventory of currently pending fires
 
+`MobWake.SelfTest` is the plugin's on-device self-test: run `mix mob.selftest` from a host app (mob_dev 0.7.17+) to prove the NIF and the Android bridge answer on a device.
+
 ## Related plugins
 
 * [`mob_push`](https://hexdocs.pm/mob_push) — the *send* side of silent APNs / FCM. When you want deterministic wake timing, `mob_push` sends the trigger and `mob_wake` receives it. Use `MobWake.wake_payload/2` to build the payload for `MobPush.send/3` — same shape on both platforms (see [the identifier-and-payload ADR](decisions/2026-09-18-identifier-and-payload-schema.md)).
